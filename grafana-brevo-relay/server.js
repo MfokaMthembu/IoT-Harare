@@ -8,7 +8,7 @@ const {
   BREVO_API_KEY,
   ALERT_FROM_EMAIL,
   ALERT_FROM_NAME = "Grafana Alerts",
-  ALERT_TO_EMAIL,
+  ALERT_TO_EMAIL = "admin@example.com,network@example.com,alerts@example.com",
   RELAY_SECRET,
 } = process.env;
 
@@ -60,7 +60,7 @@ async function sendEmail(subject, textContent) {
           name: ALERT_FROM_NAME,
           email: ALERT_FROM_EMAIL,
         },
-        to: [{ email: ALERT_TO_EMAIL }],
+        to: ALERT_TO_EMAIL.split(",").map((email) => ({ email: email.trim() })),
         subject,
         textContent,
       }),
