@@ -60,7 +60,7 @@ async function sendEmail(subject, textContent) {
           name: ALERT_FROM_NAME,
           email: ALERT_FROM_EMAIL,
         },
-        to: ALERT_TO_EMAIL.split(",").map((email) => ({ email: email.trim() })),
+        to: ALERT_TO_EMAIL.split(",").map(email => ({ email: email.trim() })),
         subject,
         textContent,
       }),
