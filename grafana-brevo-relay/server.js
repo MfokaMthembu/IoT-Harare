@@ -93,10 +93,23 @@ function buildAlertEmail(payload) {
         ? "Resolved"
         : overallStatus;
 
-  const subject = `[${overallStatus}] Water & Sewer Monitoring - ${
+  const severities = [
+    ...new Set(
+      alerts.map((alert) =>
+        String(alert.labels?.severity || "warning").toLowerCase()
+      )
+    ),
+  ];
+
+  const severity =
+    severities.includes("critical") ? "CRITICAL" :
+    severities.includes("warning") ? "WARNING" :
+    "ALERT";
+
+  const subject = `[${severity}] Water & Sewer Monitoring - ${
     alerts.length
   } alert${alerts.length === 1 ? "" : "s"}`;
-
+  
   const alertSections = alerts.map((alert, index) => {
     const labels = alert.labels || {};
     const annotations = alert.annotations || {};
