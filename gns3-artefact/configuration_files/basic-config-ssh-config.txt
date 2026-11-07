@@ -1,0 +1,12 @@
+hostname H-Metro-01
+ip domain name harare.local
+no ip domain lookup
+!
+username mla privilege 15 secret HarareEaD1234
+username ansible privilege 15 secret AnsiHarareIoT
+!
+crypto key generate rsa modulus 2048
+ip ssh version 2
+line vty 0 4
+ login local
+ transport input ssh

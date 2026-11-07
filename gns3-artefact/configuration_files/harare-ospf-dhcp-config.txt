@@ -1,0 +1,40 @@
+configure terminal
+!
+interface Loopback0
+ description MANAGEMENT-AND-ROUTER-ID
+ ip address 172.20.99.11 255.255.255.255
+!
+no interface FastEthernet0/0.100
+!
+router ospf 1
+ router-id 172.20.99.11
+ passive-interface default
+ no passive-interface Serial1/0
+ no passive-interface Serial1/1
+ network 172.20.99.11 0.0.0.0 area 0
+ network 172.20.1.0 0.0.0.15 area 0
+ network 172.20.10.0 0.0.0.63 area 0
+ network 172.20.10.64 0.0.0.63 area 0
+ network 172.20.100.0 0.0.0.3 area 0
+ network 172.20.100.8 0.0.0.3 area 0
+!
+ip route 0.0.0.0 0.0.0.0 172.20.100.1 250
+!
+ip dhcp excluded-address 172.20.10.1 172.20.10.10
+ip dhcp excluded-address 172.20.10.65 172.20.10.74
+!
+ip dhcp pool HARARE-WATER
+ network 172.20.10.0 255.255.255.192
+ default-router 172.20.10.1
+ domain-name harare.local
+ dns-server 8.8.8.8
+ lease 1
+!
+ip dhcp pool HARARE-SEWER
+ network 172.20.10.64 255.255.255.192
+ default-router 172.20.10.65
+ domain-name harare.local
+ dns-server 8.8.8.8
+ lease 1
+end
+write memory

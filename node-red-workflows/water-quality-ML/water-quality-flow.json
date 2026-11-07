@@ -1,0 +1,216 @@
+[
+  {
+    "id": "water_quality_tab",
+    "type": "tab",
+    "label": "water-quality-workflow",
+    "disabled": false,
+    "info": "Stage 1-4: Receive water-quality MQTT telemetry, validate and normalize messages, insert accepted readings into Railway TimescaleDB, evaluate each inserted reading against configured thresholds, then create de-duplicated decision events and proposed operator actions (simulation only)."
+  },
+  {
+    "id": "wq_readme",
+    "type": "comment",
+    "z": "water_quality_tab",
+    "name": "Water Quality — MQTT validation + DB insertion + thresholds + decision events",
+    "info": "Reuses existing b_hre MQTT broker configuration. Topic: hre/water-quality-telemetry/harare/#. Accepted readings are inserted into water_quality_telemetry using a dedicated PostgreSQL pool. Each inserted reading is then evaluated by WQ_THRESHOLD_ENGINE against water_quality_limits (msg.threshold). Rejected packets go to a separate Debug output. No physical actions occur. WQ_DECISION_EVENT creates decision_event and action_log rows for warning/critical readings (suppressing duplicates while an open/acknowledged event exists). Simulation only.",
+    "x": 420,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "wq_mqtt_harare",
+    "type": "mqtt in",
+    "z": "water_quality_tab",
+    "name": "Water quality — Harare MQTT",
+    "topic": "hre/water-quality-telemetry/harare/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 190,
+    "y": 140,
+    "wires": [
+      [
+        "wq_validate"
+      ]
+    ]
+  },
+  {
+    "id": "wq_validate",
+    "type": "function",
+    "z": "water_quality_tab",
+    "name": "Validate and normalize",
+    "func": "const ALLOWED = {\n    ph: { unit: 'pH', min: 0, max: 14 },\n    turbidity: { unit: 'NTU', min: 0, max: Infinity },\n    conductivity: { unit: 'uS/cm', min: 0, max: Infinity },\n    chlorine_residual: { unit: 'mg/L', min: 0, max: Infinity },\n    temperature: { unit: '°C', min: -5, max: 100 }\n};\n\nfunction reject(reason, detail) {\n    const raw = msg.payload;\n    let preview;\n    try { preview = typeof raw === 'string' ? raw : JSON.stringify(raw); }\n    catch (e) { preview = String(raw); }\n    return [null, {\n        topic: msg.topic,\n        payload: {\n            accepted: false,\n            reason,\n            detail: String(detail || '').slice(0, 200),\n            source_topic: msg.topic,\n            packet: String(preview || '').slice(0, 500),\n            rejected_at: new Date().toISOString()\n        }\n    }];\n}\n\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') {\n    try { p = JSON.parse(p); }\n    catch (e) { return reject('bad_json', e.message); }\n}\nif (!p || typeof p !== 'object' || Array.isArray(p)) {\n    return reject('bad_shape', 'Expected a JSON object');\n}\n\nconst parts = String(msg.topic || '').split('/');\nif (parts.length < 4 || parts[0] !== 'hre' || parts[1] !== 'water-quality-telemetry' || parts[2] !== 'harare') {\n    return reject('bad_topic', msg.topic);\n}\nif (typeof p.sensor_id !== 'string' || !p.sensor_id.trim()) {\n    return reject('missing_sensor_id', 'sensor_id must be a non-empty string');\n}\nconst topicSensor = parts.length === 4 ? parts[3] : null;\nif (topicSensor && topicSensor !== p.sensor_id) {\n    return reject('topic_sensor_mismatch', 'Topic sensor does not match payload sensor_id');\n}\n\nlet ts = p.ts !== undefined ? p.ts : p.timestamp;\nlet millis = ts === undefined ? Date.now() : (typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(ts));\nif (!Number.isFinite(millis)) return reject('bad_timestamp', ts);\nif (millis > Date.now() + 5 * 60 * 1000) return reject('timestamp_in_future', ts);\nif (millis < Date.now() - 30 * 86400000) return reject('timestamp_too_old', ts);\nconst normalizedTime = new Date(millis).toISOString();\n\nlet candidates;\nif (p.readings && typeof p.readings === 'object' && !Array.isArray(p.readings)) {\n    candidates = Object.entries(p.readings);\n} else if (typeof p.metric_type === 'string' && p.value !== undefined) {\n    candidates = [[p.metric_type, p.value]];\n} else {\n    return reject('missing_reading', 'Provide metric_type and value, or a readings object');\n}\n\nconst quality = p.quality_status === undefined ? 'valid' : p.quality_status;\nif (!['valid', 'suspect', 'invalid'].includes(quality)) {\n    return reject('bad_quality_status', quality);\n}\n\nconst accepted = [];\nconst dropped = [];\nfor (const [metric, raw] of candidates) {\n    const spec = ALLOWED[metric];\n    if (!spec) { dropped.push({ metric, reason: 'unknown_metric' }); continue; }\n    const value = (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : raw;\n    if (typeof value !== 'number' || !Number.isFinite(value)) {\n        dropped.push({ metric, reason: 'not_numeric' }); continue;\n    }\n    if (value < spec.min || value > spec.max) {\n        dropped.push({ metric, reason: 'implausible_value' }); continue;\n    }\n    accepted.push({\n        topic: msg.topic,\n        payload: {\n            sensor_id: p.sensor_id,\n            municipality: 'harare',\n            metric_type: metric,\n            value,\n            unit: spec.unit,\n            ts: normalizedTime,\n            quality_status: quality,\n            source_topic: msg.topic,\n            edge_received_at: new Date().toISOString()\n        }\n    });\n}\nif (accepted.length === 0) return reject(dropped.length ? 'no_valid_readings' : 'no_readings', dropped);\nif (dropped.length) node.warn('Some readings were rejected for sensor ' + p.sensor_id + ': ' + JSON.stringify(dropped));\nnode.status({ fill: 'green', shape: 'dot', text: p.sensor_id + ' | accepted ' + accepted.length });\nreturn [accepted, null];",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 450,
+    "y": 140,
+    "wires": [
+      [
+        "wq_debug_valid",
+        "wq_db_insert"
+      ],
+      [
+        "wq_debug_rejected"
+      ]
+    ]
+  },
+  {
+    "id": "wq_db_insert",
+    "type": "function",
+    "z": "water_quality_tab",
+    "name": "WQ DATABASE INSERT",
+    "func": "const pool = global.get('hre_pool:harare');\nif (!pool) {\n    node.error('Water-quality PostgreSQL pool is not initialized. Check the Function node On Start and PostgreSQL environment settings.', msg);\n    return null;\n}\n\nconst r = msg.payload;\nconst allowedMetrics = ['ph', 'turbidity', 'conductivity', 'chlorine_residual', 'temperature'];\n\nif (!r || typeof r !== 'object' ||\n    typeof r.sensor_id !== 'string' || !r.sensor_id ||\n    !allowedMetrics.includes(r.metric_type) ||\n    typeof r.value !== 'number' || !Number.isFinite(r.value) ||\n    !r.ts) {\n    node.error('Invalid normalized water-quality reading; insert skipped.', msg);\n    return null;\n}\n\nconst sql = `\n    INSERT INTO water_quality_telemetry\n        (time, sensor_id, metric_type, value, edge_received_at, received_at, quality_status)\n    VALUES\n        ($1::timestamptz, $2, $3, $4, $5::timestamptz, now(), $6)\n    ON CONFLICT (sensor_id, metric_type, time) DO NOTHING\n    RETURNING time, sensor_id, metric_type, value, quality_status\n`;\n\nconst params = [\n    r.ts,\n    r.sensor_id,\n    r.metric_type,\n    r.value,\n    r.edge_received_at || r.ts,\n    r.quality_status || 'valid'\n];\n\npool.query(sql, params)\n    .then(result => {\n        if (result.rowCount === 0) {\n            node.status({ fill: 'yellow', shape: 'ring', text: 'duplicate skipped' });\n            node.warn('Duplicate water-quality reading skipped: ' + r.sensor_id + ' / ' + r.metric_type + ' / ' + r.ts);\n            return;\n        }\n        msg.topic = 'water_quality_inserted';\n        msg.payload = result.rows[0];\n        node.status({ fill: 'green', shape: 'dot', text: 'inserted ' + r.sensor_id });\n        node.send(msg);\n    })\n    .catch(err => {\n        node.status({ fill: 'red', shape: 'ring', text: 'database insert failed' });\n        node.error('Water-quality database insert failed: ' + err.message, msg);\n    });\n\nreturn null;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool harare: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:harare', p);",
+    "finalize": "const p = global.get('hre_pool:harare');\nglobal.set('hre_pool:harare', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 720,
+    "y": 160,
+    "wires": [
+      [
+        "wq_debug_inserted",
+        "wq_threshold_engine"
+      ]
+    ]
+  },
+  {
+    "id": "wq_threshold_engine",
+    "type": "function",
+    "z": "water_quality_tab",
+    "name": "WQ_THRESHOLD_ENGINE",
+    "func": "const p = global.get('hre_pool:harare');\nconst r = msg.payload;\n\nif (!p) {\n    node.error(\"Harare PostgreSQL pool is unavailable\", msg);\n    return;\n}\n\nif (!r || !r.sensor_id || !r.metric_type ||\n    r.value === undefined || r.value === null) {\n    node.error(\"Missing sensor_id, metric_type, or value\", msg);\n    return;\n}\n\nconst sql = `\n    SELECT\n        l.limit_id,\n        l.warning_min,\n        l.warning_max,\n        l.critical_min,\n        l.critical_max,\n        l.unit,\n        l.description\n    FROM public.water_quality_sensor s\n    JOIN public.water_quality_limits l\n      ON l.metric_type = $2\n     AND l.enabled = TRUE\n     AND (l.ward_id IS NULL OR l.ward_id = s.ward_id)\n     AND l.asset_id IS NULL\n    WHERE s.sensor_id = $1\n      AND s.active = TRUE\n    ORDER BY\n      (l.ward_id IS NOT NULL) DESC,\n      l.created_at DESC\n`;\n\np.query(sql, [r.sensor_id, r.metric_type])\n.then(result => {\n    if (result.rows.length === 0) {\n        msg.threshold = {\n            status: \"no_limit_configured\",\n            severity: \"unknown\",\n            message: \"No applicable threshold found\"\n        };\n        node.send(msg);\n        return;\n    }\n\n    const limit = result.rows[0];\n    const value = Number(r.value);\n\n    let severity = \"normal\";\n\n    if (\n        (limit.critical_min !== null &&\n         value < Number(limit.critical_min)) ||\n        (limit.critical_max !== null &&\n         value > Number(limit.critical_max))\n    ) {\n        severity = \"critical\";\n    } else if (\n        (limit.warning_min !== null &&\n         value < Number(limit.warning_min)) ||\n        (limit.warning_max !== null &&\n         value > Number(limit.warning_max))\n    ) {\n        severity = \"warning\";\n    }\n\n    msg.threshold = {\n        status: \"evaluated\",\n        severity,\n        limit_id: limit.limit_id,\n        metric_type: r.metric_type,\n        sensor_id: r.sensor_id,\n        value,\n        unit: limit.unit,\n        description: limit.description\n    };\n\n    node.send(msg);\n})\n.catch(err => {\n    node.error(\"WQ threshold query failed: \" + err.message, msg);\n});\n\nreturn;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 990,
+    "y": 220,
+    "wires": [
+      [
+        "wq_debug_threshold",
+        "wq_decision_event"
+      ]
+    ]
+  },
+  {
+    "id": "wq_debug_threshold",
+    "type": "debug",
+    "z": "water_quality_tab",
+    "name": "Threshold evaluation",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "threshold",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 1250,
+    "y": 280,
+    "wires": []
+  },
+  {
+    "id": "wq_debug_valid",
+    "type": "debug",
+    "z": "water_quality_tab",
+    "name": "Accepted water-quality readings",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 760,
+    "y": 90,
+    "wires": []
+  },
+  {
+    "id": "wq_debug_rejected",
+    "type": "debug",
+    "z": "water_quality_tab",
+    "name": "Rejected messages",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 740,
+    "y": 280,
+    "wires": []
+  },
+  {
+    "id": "wq_debug_inserted",
+    "type": "debug",
+    "z": "water_quality_tab",
+    "name": "Inserted into Railway",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 990,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "wq_decision_event",
+    "type": "function",
+    "z": "water_quality_tab",
+    "name": "WQ DECISION EVENT",
+    "func": "const p = global.get('hre_pool:harare');\nconst r = msg.payload;\nconst t = msg.threshold;\n\nif (!p) {\n    node.error(\"Harare PostgreSQL pool is unavailable\", msg);\n    return;\n}\n\nif (!t || t.status !== \"evaluated\") {\n    node.warn(\"Skipping event creation: threshold was not evaluated\");\n    return;\n}\n\n// Normal readings do not create events.\nif (t.severity === \"normal\") {\n    msg.decision = {\n        status: \"no_event\",\n        reason: \"Reading is within configured limits\"\n    };\n    node.send(msg);\n    return;\n}\n\nif (![\"warning\", \"critical\"].includes(t.severity)) {\n    node.error(\"Unexpected threshold severity\", msg);\n    return;\n}\n\nconst metric = r.metric_type;\nconst sensor = r.sensor_id;\nconst value = Number(r.value);\nconst severity = t.severity;\n\nlet recommendation;\n\nif (metric === \"turbidity\" && severity === \"critical\") {\n    recommendation =\n        \"Verify the reading and inspect the turbidity sensor. \" +\n        \"Check filter condition, treatment process records, and \" +\n        \"upstream conditions. Confirm findings with the operator \" +\n        \"before considering any isolation or treatment change.\";\n} else if (metric === \"turbidity\") {\n    recommendation =\n        \"Verify the turbidity reading, inspect sensor condition, \" +\n        \"and review filter performance and recent readings.\";\n} else if (metric === \"ph\" && severity === \"critical\") {\n    recommendation =\n        \"Verify the pH reading using an appropriate independent \" +\n        \"measurement. Check sensor calibration and review treatment \" +\n        \"process conditions. Notify the responsible operator for assessment.\";\n} else if (metric === \"ph\") {\n    recommendation =\n        \"Verify the pH reading, check sensor calibration, and \" +\n        \"review recent measurements and treatment process conditions.\";\n} else {\n    recommendation =\n        \"Verify the reading and sensor condition, inspect recent \" +\n        \"measurements, and request operator assessment.\";\n}\n\nconst eventType = \"water_quality_limit_exceeded\";\nconst lockKey = [\n    sensor,\n    metric,\n    severity,\n    eventType\n].join(\"|\");\n\nlet client;\n\n(async () => {\n    try {\n        client = await p.connect();\n        await client.query(\"BEGIN\");\n\n        // Serialize duplicate checks for this sensor/metric/severity.\n        await client.query(\n            \"SELECT pg_advisory_xact_lock(hashtext($1))\",\n            [lockKey]\n        );\n\n        const existing = await client.query(\n            `SELECT event_id, severity\n             FROM public.decision_event\n             WHERE sensor_id = $1\n               AND metric_type = $2\n               AND event_type = $3\n               AND severity = $4\n               AND status IN ('open', 'acknowledged')\n             ORDER BY detected_at DESC\n             LIMIT 1`,\n            [sensor, metric, eventType, severity]\n        );\n\n        if (existing.rows.length > 0) {\n            await client.query(\"COMMIT\");\n\n            msg.decision = {\n                status: \"duplicate_suppressed\",\n                event_id: existing.rows[0].event_id,\n                severity,\n                sensor_id: sensor,\n                metric_type: metric,\n                value\n            };\n\n            node.send(msg);\n            return;\n        }\n\n        const eventResult = await client.query(\n            `INSERT INTO public.decision_event\n                (source, event_type, severity, status,\n                 sensor_id, metric_type, observed_value,\n                 message, recommended_action, details)\n             VALUES\n                ('threshold', $1, $2, 'open',\n                 $3, $4, $5, $6, $7, $8::jsonb)\n             RETURNING event_id, detected_at`,\n            [\n                eventType,\n                severity,\n                sensor,\n                metric,\n                value,\n                `${metric} threshold breach: ${value} ${t.unit}.`,\n                recommendation,\n                JSON.stringify({\n                    threshold_limit_id: t.limit_id,\n                    unit: t.unit,\n                    threshold_description: t.description,\n                    simulation: true\n                })\n            ]\n        );\n\n        const event = eventResult.rows[0];\n\n        const actionResult = await client.query(\n            `INSERT INTO public.action_log\n                (event_id, action_type, status, requested_by, notes)\n             VALUES\n                ($1, $2, 'proposed', 'system', $3)\n             RETURNING action_id`,\n            [\n                event.event_id,\n                \"operator_inspection\",\n                recommendation +\n                \" Simulation only: no physical equipment was operated.\"\n            ]\n        );\n\n        await client.query(\"COMMIT\");\n\n        msg.decision = {\n            status: \"event_created\",\n            event_id: event.event_id,\n            action_id: actionResult.rows[0].action_id,\n            severity,\n            sensor_id: sensor,\n            metric_type: metric,\n            value,\n            recommendation\n        };\n\n        node.send(msg);\n    } catch (err) {\n        if (client) {\n            try {\n                await client.query(\"ROLLBACK\");\n            } catch (_) {}\n        }\n\n        node.error(\"WQ decision event failed: \" + err.message, msg);\n    } finally {\n        if (client) client.release();\n    }\n})();\n\nreturn;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1250,
+    "y": 200,
+    "wires": [
+      [
+        "wq_debug_decision"
+      ]
+    ]
+  },
+  {
+    "id": "wq_debug_decision",
+    "type": "debug",
+    "z": "water_quality_tab",
+    "name": "Decision event",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "decision",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 1500,
+    "y": 200,
+    "wires": []
+  }
+]

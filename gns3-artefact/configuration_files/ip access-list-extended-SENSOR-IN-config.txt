@@ -1,0 +1,13 @@
+ip access-list extended SENSOR-IN
+ permit udp any eq bootpc any eq bootps
+ permit tcp any host 172.20.200.1 eq 1883
+ deny   ip any any log
+!
+! Harare
+interface FastEthernet0/0.110
+ ip access-group SENSOR-IN in
+interface FastEthernet0/0.111
+ ip access-group SENSOR-IN in
+! Chitungwiza: sub-interfaces .120 and .121
+! Epworth: sub-interfaces .130 and .131
+! Ruwa: sub-interfaces .140 and .141

@@ -1,0 +1,36 @@
+          stage           |  n   |  p50  |  p95  |  max   
+--------------------------+------+-------+-------+--------
+ ingestion (edge -> db)   | 2648 | 0.352 | 0.375 | 29.166
+ pipeline (time -> db)    | 2648 | 0.888 | 1.329 | 29.181
+ transport (time -> edge) | 2648 | 0.527 | 0.964 |  3.258
+(3 rows)
+
+      sensor_id       |  fault_type   | severity |  source  | n  
+----------------------+---------------+----------+----------+----
+ chitungwiza-sewer-12 | infiltration  | warning  | baseline |  3
+ chitungwiza-water-03 | high_pressure | critical | sensor   | 21
+ chitungwiza-water-03 | high_pressure | critical | baseline |  5
+ chitungwiza-water-08 | leak          | warning  | sensor   |  2
+ chitungwiza-water-08 | leak          | warning  | baseline |  1
+ chitungwiza-water-08 | leak          | critical | sensor   |  2
+ epworth-water-03     | supply_loss   | critical | sensor   | 40
+ epworth-water-03     | supply_loss   | critical | baseline | 10
+ epworth-water-05     | reservoir_low | critical | sensor   |  1
+ epworth-water-05     | reservoir_low | warning  | baseline |  1
+ harare-sewer-07      | blockage      | critical | sensor   | 10
+ harare-sewer-12      | surcharge     | warning  | baseline |  3
+ harare-water-03      | burst         | critical | sensor   | 40
+ harare-water-03      | burst         | critical | baseline | 10
+ ruwa-sewer-03        | overflow      | critical | sensor   | 60
+ ruwa-water-08        | low_pressure  | warning  | baseline |  4
+(16 rows)
+
+ fault_type | severity | source | n 
+------------+----------+--------+---
+(0 rows)
+
+ readings | sensors 
+----------+---------
+     6679 |     190
+(1 row)
+

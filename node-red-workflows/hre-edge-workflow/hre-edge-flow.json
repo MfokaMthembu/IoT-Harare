@@ -1,0 +1,2324 @@
+[
+  {
+    "id": "c_readme",
+    "type": "comment",
+    "name": "HRE EDGE: one lane per municipality, each with its own uplink",
+    "info": "Sensors (Python nodes) -> MQTT hre/telemetry/<municipality>/# -> lane: VALIDATE -> EVALUATE -> CLOUD LINK -> database.\nEvery lane has its own MQTT subscription, validator, fault evaluator, database connection, up/down state and spool folder (~/.node-red/hre-edge/spool/<municipality>/). One municipality losing its uplink never delays another.\nThe EDGE lane carries province-wide and edge-level events (province outage, edge power).\nSettings come from environment variables: PG*, MQTT_HOST/PORT/USER/PASSWORD, EDGE_ID, HRE_DIR, OFFLINE_AFTER_MIN, BATCH_MS. Nothing sensitive is stored in this flow.",
+    "x": 1500,
+    "y": 40,
+    "wires": [],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_in_harare",
+    "type": "mqtt in",
+    "name": "hre/telemetry/harare/#",
+    "topic": "hre/telemetry/harare/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 150,
+    "wires": [
+      [
+        "v_harare"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_harare"
+  },
+  {
+    "id": "v_harare",
+    "type": "function",
+    "name": "Validate: harare",
+    "func": "const LANE = 'harare';\n// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };\n// =============================================================================\n// VALIDATE & FILTER. Input contract (same for the simulator and, later, MQTT):\n//   { \"sensor_id\": \"harare-water-01\", \"ts\": \"2026-10-10T12:00:00Z\",\n//     \"readings\": { \"pressure\": 3.1, \"flow_rate\": 12.4, \"level\": 71 } }\n// Output 1: clean packet. Output 2: rejected packet with a reason.\n// =============================================================================\nconst stats = flow.get('stats:' + LANE) || { ok: 0, rejected: 0, duplicates: 0, reasons: {} };\nconst PHYS = { pressure: [0, 25], flow_rate: [0, 500], level: [0, 100] };   // physically possible, not fault limits\nconst HOLD_MAX = 100000;\n\nfunction show() { node.status({ fill: stats.rejected ? 'yellow' : 'green', shape: 'dot', text: LANE + ' | ok ' + stats.ok + ' | rejected ' + stats.rejected + ' | dup ' + stats.duplicates }); }\n\nfunction handle(msg) {\n  const ref = global.get('reference');\n  const reject = (reason, detail) => {\n    stats.rejected++; stats.reasons[reason] = (stats.reasons[reason] || 0) + 1;\n    flow.set('stats:' + LANE, stats); show();\n    return [null, { payload: { reason, detail, packet: String(typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)).slice(0, 200) } }];\n  };\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return reject('bad_json'); } }\nif (!p || typeof p !== 'object' || Array.isArray(p)) return reject('bad_shape');\nif (!ref) return reject('no_reference_data');\nif (typeof p.sensor_id !== 'string' || !ref.sensors[p.sensor_id]) return reject('unknown_sensor', p.sensor_id);\nconst s = ref.sensors[p.sensor_id];\nif (!s.active) return reject('inactive_sensor', p.sensor_id);\nif (typeof msg.topic === 'string' && msg.topic.startsWith('hre/telemetry/')) {   // hre/telemetry/<municipality>/<sensor_id>\n  const parts = msg.topic.split('/');\n  if (parts.length !== 4) return reject('bad_topic', msg.topic);\n  if (parts[3] !== p.sensor_id) return reject('topic_sensor_mismatch', msg.topic);\n  if (s.muni && parts[2] !== s.muni) return reject('topic_municipality_mismatch', msg.topic);\n}\nif (!p.readings || typeof p.readings !== 'object') return reject('no_readings');\n\nlet ts = Date.now();\nif (p.ts !== undefined) ts = typeof p.ts === 'number' ? (p.ts < 1e12 ? p.ts * 1000 : p.ts) : Date.parse(p.ts);\nif (!Number.isFinite(ts)) return reject('bad_timestamp');\nif (ts > Date.now() + 5 * 60000) return reject('timestamp_in_future', p.ts);\nif (ts < Date.now() - 30 * 86400000) return reject('timestamp_too_old', p.ts);\nts = Math.round(ts / 1000) * 1000;\n\nconst seen = context.get('seen') || new Set();\nconst allowed = ref.baseline[s.type] || {};\nconst out = [], dropped = [];\nfor (const [metric, raw] of Object.entries(p.readings)) {\n  if (!allowed[metric]) { dropped.push('unknown_metric'); continue; }\n  const v = (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : raw;\n  if (typeof v !== 'number' || !Number.isFinite(v)) { dropped.push('not_numeric'); continue; }\n  const [lo, hi] = PHYS[metric] || [-Infinity, Infinity];\n  if (v < lo || v > hi) { dropped.push('implausible_value'); continue; }\n  const key = p.sensor_id + '|' + metric + '|' + ts;\n  if (seen.has(key)) { stats.duplicates++; dropped.push('duplicate'); continue; }\n  seen.add(key);\n  if (seen.size > 5000) seen.delete(seen.values().next().value);\n  out.push({ metric, value: Math.round(v * 1000) / 1000 });\n}\ncontext.set('seen', seen);\nif (!out.length) return reject(dropped[0] || 'no_valid_readings', p.sensor_id);\n\nconst ls = pget('lastSeen', {});\nls[p.sensor_id] = Math.max(ls[p.sensor_id] || 0, ts);\npset('lastSeen', ls);\n\nstats.ok++; flow.set('stats:' + LANE, stats); show();\nreturn [{ payload: { sensor_id: p.sensor_id, ts: new Date(ts).toISOString(), sensor: s, readings: out, arrived: new Date(msg._arrived || Date.now()).toISOString(), trigger: ['schedule', 'threshold', 'recovery'].includes(p.trigger) ? p.trigger : 'schedule' } }, null];\n}\n\n// Reference data (sensors + baseline) may not be loaded for a moment after a restart, exactly when\n// the broker delivers the backlog queued while we were down. Hold those packets, never drop them.\nif (msg.topic === 'release') {\n  const held = context.get('held') || [];\n  context.set('held', []);\n  const v = [], r = [];\n  for (const m of held) { const o = handle(m); if (o[0]) v.push(o[0]); if (o[1]) r.push(o[1]); }\n  if (held.length) node.log('reference data ready: released ' + held.length + ' held packet(s)');\n  return [v.length ? v : null, r.length ? r : null];\n}\nmsg._arrived = Date.now();                                   // when the packet reached the edge (kept while held)\nif (!global.get('reference')) {\n  const held = context.get('held') || [];\n  if (held.length < HOLD_MAX) held.push({ topic: msg.topic, payload: msg.payload, _arrived: msg._arrived });\n  else node.warn('hold buffer full: dropping packets until reference data loads');\n  context.set('held', held);\n  node.status({ fill: 'yellow', shape: 'ring', text: 'holding ' + held.length + ' packet(s) until reference data loads' });\n  return null;\n}\nreturn handle(msg);\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 150,
+    "wires": [
+      [
+        "e_harare"
+      ],
+      [
+        "d_rej"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_harare"
+  },
+  {
+    "id": "e_harare",
+    "type": "function",
+    "name": "Evaluate: harare",
+    "func": "// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };// =============================================================================\n// EVALUATE: build telemetry rows and compare each reading with the cached baseline.\n// Runs at the edge, so faults are detected even while the uplink is down.\n//   ok -> warning (after WARN_CONFIRM consecutive readings) -> critical -> cleared\n// Critical alerts fire on the FIRST reading. One alert per state change, never per reading.\n// The fault type is diagnosed from the PATTERN across the packet's metrics, not from one metric:\n//   water : pressure low + flow high = leak (burst if both critical) | both low = supply_loss\n//           pressure low = low_pressure | pressure high = high_pressure | level = reservoir_low/high\n//   sewer : level high + flow low = blockage | level high + flow high = overflow\n//           level high alone = surcharge (warning) or overflow (critical) | flow high = infiltration\n// If the picture changes while a fault is open (e.g. low_pressure becomes a leak), the old type is\n// closed with a 'cleared' alert and the new one opened, so open faults never show stale types.\n// =============================================================================\nconst ref = global.get('reference');\nconst p = msg.payload, s = p.sensor;\nconst WARN_CONFIRM = Number(env.get('WARN_CONFIRM')) || 2;\nconst states = pget('alertState', {});\nconst rows = [];\n\nconst classify = (v, b) => v < b.cmin ? ['critical', 'low'] : v > b.cmax ? ['critical', 'high']\n                         : v < b.nmin ? ['warning', 'low'] : v > b.nmax ? ['warning', 'high'] : ['ok', null];\nconst lv = {};\nfor (const r of p.readings) {\n  const b = ref.baseline[s.type] && ref.baseline[s.type][r.metric];\n  if (b) { const [level, dir] = classify(r.value, b); lv[r.metric] = { level, dir }; }\n}\nconst out = (m, d) => !!lv[m] && lv[m].level !== 'ok' && lv[m].dir === d;     // metric outside normal in direction d\n\nfunction diagnose(metric) {\n  const d = lv[metric].dir;\n  if (s.type === 'water') {\n    if (metric === 'level') return d === 'low' ? 'reservoir_low' : 'reservoir_high';\n    if (metric === 'pressure' && d === 'high') return 'high_pressure';\n    const pLow = out('pressure', 'low'), fHigh = out('flow_rate', 'high'), fLow = out('flow_rate', 'low');\n    if (pLow && fHigh) return (lv.pressure.level === 'critical' && lv.flow_rate.level === 'critical') ? 'burst' : 'leak';\n    if (pLow && fLow) return 'supply_loss';\n    if (metric === 'pressure') return 'low_pressure';\n    return d === 'high' ? 'high_flow' : 'low_flow';\n  }\n  const lHigh = out('level', 'high'), fLow = out('flow_rate', 'low'), fHigh = out('flow_rate', 'high');\n  if (lHigh && fLow) return 'blockage';\n  if (lHigh && fHigh) return 'overflow';\n  if (metric === 'level') return d === 'high' ? (lv.level.level === 'critical' ? 'overflow' : 'surcharge') : 'low_level';\n  return d === 'high' ? 'infiltration' : 'low_flow';\n}\n\nfor (const r of p.readings) {\n  rows.push({ t: 'telemetry', r: { time: p.ts, sensor_id: p.sensor_id, metric_type: r.metric, value: r.value } });\n  if (s.suppressed || !lv[r.metric]) continue;                 // muted sensor: keep the data, raise nothing\n  const { level, dir } = lv[r.metric];\n  const b = ref.baseline[s.type][r.metric];\n  const key = p.sensor_id + '|' + r.metric;\n  const st = states[key] || { s: 'ok', n: 0, ft: null };\n\n  let emit = null;\n  if (level === 'critical') { if (st.s !== 'critical') emit = 'critical'; st.n = 0; }\n  else if (level === 'warning') {\n    if (st.s === 'critical') emit = 'warning';                 // improving, still outside normal\n    else if (st.s === 'ok') { st.n++; if (st.n >= WARN_CONFIRM) emit = 'warning'; }\n  } else { st.n = 0; if (st.s !== 'ok') emit = 'cleared'; }\n\n  if (emit === 'cleared') {\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft || 'out_of_range', severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reading back within normal range' } });\n    st.s = 'ok'; st.ft = null;\n  } else if (emit) {\n    const ft = diagnose(r.metric);\n    if (st.s !== 'ok' && st.ft && st.ft !== ft)                // picture changed: close the old type first\n      rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft, severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reclassified as ' + ft } });\n    const message = r.metric.replace('_', ' ') + ' ' + r.value + ' ' + (b.unit || '') + ' is ' + (dir === 'low' ? 'below' : 'above') + ' the ' + (emit === 'critical' ? 'critical' : 'normal') + ' limit (' + ft.replace('_', ' ') + ')';\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: p.trigger === 'threshold' ? 'sensor' : 'baseline', fault_type: ft, severity: emit, metric_type: r.metric, value: r.value, message } });\n    st.s = emit; st.ft = ft;\n  }\n  states[key] = st;\n}\nfor (const x of rows) x.r.edge_received_at = p.arrived;      // when the packet reached the edge\npset('alertState', states);\nnode.status({ fill: 'green', shape: 'dot', text: rows.some(x => x.t === 'alert') ? 'alert raised' : 'normal' });\nreturn { topic: 'data', payload: rows };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1820,
+    "y": 150,
+    "wires": [
+      [
+        "cl_harare"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_harare"
+  },
+  {
+    "id": "cl_harare",
+    "type": "function",
+    "name": "CLOUD LINK: harare",
+    "func": "// =============================================================================\n// CLOUD LINK, lane 'harare': this municipality's OWN uplink to the database.\n//   topic 'data' : array of {t:'telemetry'|'alert'|'edge_event', r:{row}}, micro-batched (BATCH_MS)\n//   topic 'tick' : flush + health check + replay of this lane's spool (every 30 s, or on demand)\n// Online  -> insert, one batched statement per table.\n// Offline -> append to spool/harare/current.ndjson (one JSON row per line, power-loss safe).\n// Restore -> replay oldest first in batches; inserts are idempotent (ON CONFLICT DO NOTHING).\n// Every lane has its own pool, spool and up/down state, so one municipality's outage never\n// delays another municipality's data.\n// =============================================================================\nconst LANE  = 'harare';\nconst DIR   = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\nconst SPOOL = path.join(DIR, 'spool', LANE);\nconst CUR   = path.join(SPOOL, 'current.ndjson');\nconst EDGE  = env.get('EDGE_ID') || 'hre-edge-01';\nconst BATCH = 500;\nconst WINDOW_MS = Number(env.get('BATCH_MS')) || 250;\nconst MAX_SPOOL = (Number(env.get('MAX_SPOOL_MB')) || 200) * 1024 * 1024;\nfs.mkdirSync(SPOOL, { recursive: true });\n\nconst pool    = global.get('hre_pool:' + LANE);\nconst UP      = 'uplink_ok:' + LANE;\nconst simDown = () => global.get('sim_uplink_down:' + LANE) === true || global.get('sim_uplink_down:all') === true;\nconst iso     = d => new Date(d).toISOString();\nconst ev      = (type, detail) => ({ t: 'edge_event', r: { time: iso(Date.now()), edge_id: EDGE, event_type: type, municipality: LANE === 'edge' ? null : LANE, ward_id: null, detail: detail ?? null } });\n\nconst SQL = {\n  telemetry: `INSERT INTO telemetry (time, sensor_id, metric_type, value, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.metric_type::metric_type_enum, x.value, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, metric_type text, value double precision, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  alert: `INSERT INTO alert (time, sensor_id, source, fault_type, severity, metric_type, value, message, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.source, x.fault_type, x.severity, x.metric_type::metric_type_enum, x.value, x.message, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, source text, fault_type text, severity text, metric_type text, value double precision, message text, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  fault_label: `INSERT INTO fault_label (time, event, sensor_id, kind, ramp_s, fault_start, fault_until, received_at)\n    SELECT x.time, x.event, x.sensor_id, x.kind, x.ramp_s, x.fault_start, x.fault_until, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, event text, sensor_id text, kind text, ramp_s double precision, fault_start timestamptz, fault_until timestamptz)\n    ON CONFLICT DO NOTHING`,\n  edge_event: `INSERT INTO edge_event (time, edge_id, event_type, municipality, ward_id, detail, received_at)\n    SELECT x.time, x.edge_id, x.event_type, x.municipality, x.ward_id, x.detail, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, edge_id text, event_type text, municipality text, ward_id int, detail jsonb)\n    ON CONFLICT DO NOTHING`\n};\n\nasync function send(rows) {\n  if (simDown()) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  for (const t of ['telemetry', 'alert', 'edge_event', 'fault_label']) {\n    const part = rows.filter(x => x.t === t).map(x => x.r);\n    for (let i = 0; i < part.length; i += BATCH)\n      await pool.query(SQL[t], [JSON.stringify(part.slice(i, i + BATCH))]);\n  }\n}\n\nconst spoolFiles = () => fs.readdirSync(SPOOL);\nconst spoolBytes = () => spoolFiles().reduce((n, f) => n + fs.statSync(path.join(SPOOL, f)).size, 0);\nconst replayFiles = () => spoolFiles().filter(f => f.startsWith('replay-')).sort();\nconst backlog = () => replayFiles().length > 0 || (fs.existsSync(CUR) && fs.statSync(CUR).size > 0);\n\nfunction spool(rows) {\n  if (spoolBytes() > MAX_SPOOL) {          // disk guard: keep alerts and events, drop telemetry\n    const n = rows.length;\n    rows = rows.filter(x => x.t !== 'telemetry');\n    node.warn(LANE + ': spool full (' + Math.round(MAX_SPOOL / 1048576) + ' MB): dropped ' + (n - rows.length) + ' telemetry rows');\n  }\n  if (rows.length) fs.appendFileSync(CUR, rows.map(x => JSON.stringify(x)).join('\\n') + '\\n');\n}\n\nfunction markDown(err) {\n  if (global.get(UP) !== false) {\n    global.set(UP, false);\n    spool([ev('uplink_down', { reason: String((err && err.message) || err).slice(0, 200) })]);\n  }\n}\nfunction markUp() {\n  const was = global.get(UP);\n  global.set(UP, true);\n  if (was === false) { spool([ev('uplink_up')]); return true; }\n  return false;\n}\n\nfunction status() {\n  const kb = Math.round(spoolBytes() / 1024);\n  if (global.get(UP) === false) node.status({ fill: 'red', shape: 'dot', text: LANE + ': uplink DOWN | spooled ' + kb + ' KB' });\n  else if (backlog()) node.status({ fill: 'yellow', shape: 'dot', text: LANE + ': syncing | ' + kb + ' KB queued' });\n  else node.status({ fill: 'green', shape: 'dot', text: LANE + ': uplink OK | queue empty' });\n}\n\nasync function flush() {\n  context.set('timer', 0);\n  const rows = context.get('buf') || [];\n  if (!rows.length) return;\n  context.set('buf', []);\n  if (!context.get('busy') && !backlog() && global.get(UP) !== false) {\n    try { await send(rows); markUp(); status(); return; } catch (e) { markDown(e); }\n  }\n  spool(rows);\n  status();\n}\n\nasync function replay() {\n  if (fs.existsSync(CUR) && fs.statSync(CUR).size > 0)\n    fs.renameSync(CUR, path.join(SPOOL, 'replay-' + Date.now() + '.ndjson'));\n  let total = 0, files = 0, oldest = null, newest = null;\n  const t0 = Date.now();\n  for (const f of replayFiles()) {\n    const full = path.join(SPOOL, f);\n    const rows = [];\n    for (const line of fs.readFileSync(full, 'utf8').split('\\n')) {\n      if (!line.trim()) continue;\n      try { rows.push(JSON.parse(line)); } catch (e) { /* torn last line after a power cut: skip */ }\n    }\n    try { await send(rows); } catch (e) { markDown(e); return false; }\n    fs.unlinkSync(full);\n    files++; total += rows.length;\n    for (const x of rows) if (x.t === 'telemetry' || x.t === 'alert') {\n      const tm = x.r.time;\n      if (!oldest || tm < oldest) oldest = tm;\n      if (!newest || tm > newest) newest = tm;\n    }\n  }\n  if (total > 0) {\n    const e = ev('sync_completed', { rows: total, files, oldest, newest, seconds: Math.round((Date.now() - t0) / 1000) });\n    try { await send([e]); } catch (err) { spool([e]); }\n  }\n  return true;\n}\n\nif (msg.topic === 'data') {\n  const rows = msg.payload;\n  if (!Array.isArray(rows) || !rows.length) return null;\n  const buf = context.get('buf') || [];\n  for (const r of rows) buf.push(r);\n  context.set('buf', buf);\n  if (buf.length >= BATCH) { await flush(); return null; }\n  const t = context.get('timer');\n  if (!t || Date.now() - t > 5000) {                 // collect simultaneous packets into one insert\n    context.set('timer', Date.now());\n    setTimeout(() => flush().catch(e => node.error(LANE + ': ' + e.message)), WINDOW_MS);\n  }\n  return null;\n}\n\nif (msg.topic === 'tick') {\n  await flush();\n  if (context.get('busy')) return null;\n  context.set('busy', true);\n  try {\n    try {\n      if (simDown()) throw new Error('simulated uplink down');\n      if (!pool) throw new Error('no database pool');\n      await pool.query('SELECT 1');\n    } catch (e) { markDown(e); status(); return null; }\n    const restored = markUp();\n    await replay();\n    status();\n    return restored ? [null, { topic: 'refresh', payload: 'uplink restored: ' + LANE }] : null;\n  } finally {\n    context.set('busy', false);\n  }\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool harare: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:harare', p);",
+    "finalize": "const p = global.get('hre_pool:harare');\nglobal.set('hre_pool:harare', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 150,
+    "wires": [
+      [],
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_harare"
+  },
+  {
+    "id": "g_harare",
+    "type": "group",
+    "name": "HARARE: water + sewer VLANs, own uplink",
+    "style": {
+      "label": true,
+      "stroke": "#1f77b4",
+      "fill": "#1f77b4",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "cl_harare",
+      "e_harare",
+      "m_in_harare",
+      "v_harare"
+    ],
+    "x": 1150,
+    "y": 95,
+    "w": 1180,
+    "h": 110,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_in_chitungwiza",
+    "type": "mqtt in",
+    "name": "hre/telemetry/chitungwiza/#",
+    "topic": "hre/telemetry/chitungwiza/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 300,
+    "wires": [
+      [
+        "v_chitungwiza"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_chitungwiza"
+  },
+  {
+    "id": "v_chitungwiza",
+    "type": "function",
+    "name": "Validate: chitungwiza",
+    "func": "const LANE = 'chitungwiza';\n// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };\n// =============================================================================\n// VALIDATE & FILTER. Input contract (same for the simulator and, later, MQTT):\n//   { \"sensor_id\": \"harare-water-01\", \"ts\": \"2026-10-10T12:00:00Z\",\n//     \"readings\": { \"pressure\": 3.1, \"flow_rate\": 12.4, \"level\": 71 } }\n// Output 1: clean packet. Output 2: rejected packet with a reason.\n// =============================================================================\nconst stats = flow.get('stats:' + LANE) || { ok: 0, rejected: 0, duplicates: 0, reasons: {} };\nconst PHYS = { pressure: [0, 25], flow_rate: [0, 500], level: [0, 100] };   // physically possible, not fault limits\nconst HOLD_MAX = 100000;\n\nfunction show() { node.status({ fill: stats.rejected ? 'yellow' : 'green', shape: 'dot', text: LANE + ' | ok ' + stats.ok + ' | rejected ' + stats.rejected + ' | dup ' + stats.duplicates }); }\n\nfunction handle(msg) {\n  const ref = global.get('reference');\n  const reject = (reason, detail) => {\n    stats.rejected++; stats.reasons[reason] = (stats.reasons[reason] || 0) + 1;\n    flow.set('stats:' + LANE, stats); show();\n    return [null, { payload: { reason, detail, packet: String(typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)).slice(0, 200) } }];\n  };\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return reject('bad_json'); } }\nif (!p || typeof p !== 'object' || Array.isArray(p)) return reject('bad_shape');\nif (!ref) return reject('no_reference_data');\nif (typeof p.sensor_id !== 'string' || !ref.sensors[p.sensor_id]) return reject('unknown_sensor', p.sensor_id);\nconst s = ref.sensors[p.sensor_id];\nif (!s.active) return reject('inactive_sensor', p.sensor_id);\nif (typeof msg.topic === 'string' && msg.topic.startsWith('hre/telemetry/')) {   // hre/telemetry/<municipality>/<sensor_id>\n  const parts = msg.topic.split('/');\n  if (parts.length !== 4) return reject('bad_topic', msg.topic);\n  if (parts[3] !== p.sensor_id) return reject('topic_sensor_mismatch', msg.topic);\n  if (s.muni && parts[2] !== s.muni) return reject('topic_municipality_mismatch', msg.topic);\n}\nif (!p.readings || typeof p.readings !== 'object') return reject('no_readings');\n\nlet ts = Date.now();\nif (p.ts !== undefined) ts = typeof p.ts === 'number' ? (p.ts < 1e12 ? p.ts * 1000 : p.ts) : Date.parse(p.ts);\nif (!Number.isFinite(ts)) return reject('bad_timestamp');\nif (ts > Date.now() + 5 * 60000) return reject('timestamp_in_future', p.ts);\nif (ts < Date.now() - 30 * 86400000) return reject('timestamp_too_old', p.ts);\nts = Math.round(ts / 1000) * 1000;\n\nconst seen = context.get('seen') || new Set();\nconst allowed = ref.baseline[s.type] || {};\nconst out = [], dropped = [];\nfor (const [metric, raw] of Object.entries(p.readings)) {\n  if (!allowed[metric]) { dropped.push('unknown_metric'); continue; }\n  const v = (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : raw;\n  if (typeof v !== 'number' || !Number.isFinite(v)) { dropped.push('not_numeric'); continue; }\n  const [lo, hi] = PHYS[metric] || [-Infinity, Infinity];\n  if (v < lo || v > hi) { dropped.push('implausible_value'); continue; }\n  const key = p.sensor_id + '|' + metric + '|' + ts;\n  if (seen.has(key)) { stats.duplicates++; dropped.push('duplicate'); continue; }\n  seen.add(key);\n  if (seen.size > 5000) seen.delete(seen.values().next().value);\n  out.push({ metric, value: Math.round(v * 1000) / 1000 });\n}\ncontext.set('seen', seen);\nif (!out.length) return reject(dropped[0] || 'no_valid_readings', p.sensor_id);\n\nconst ls = pget('lastSeen', {});\nls[p.sensor_id] = Math.max(ls[p.sensor_id] || 0, ts);\npset('lastSeen', ls);\n\nstats.ok++; flow.set('stats:' + LANE, stats); show();\nreturn [{ payload: { sensor_id: p.sensor_id, ts: new Date(ts).toISOString(), sensor: s, readings: out, arrived: new Date(msg._arrived || Date.now()).toISOString(), trigger: ['schedule', 'threshold', 'recovery'].includes(p.trigger) ? p.trigger : 'schedule' } }, null];\n}\n\n// Reference data (sensors + baseline) may not be loaded for a moment after a restart, exactly when\n// the broker delivers the backlog queued while we were down. Hold those packets, never drop them.\nif (msg.topic === 'release') {\n  const held = context.get('held') || [];\n  context.set('held', []);\n  const v = [], r = [];\n  for (const m of held) { const o = handle(m); if (o[0]) v.push(o[0]); if (o[1]) r.push(o[1]); }\n  if (held.length) node.log('reference data ready: released ' + held.length + ' held packet(s)');\n  return [v.length ? v : null, r.length ? r : null];\n}\nmsg._arrived = Date.now();                                   // when the packet reached the edge (kept while held)\nif (!global.get('reference')) {\n  const held = context.get('held') || [];\n  if (held.length < HOLD_MAX) held.push({ topic: msg.topic, payload: msg.payload, _arrived: msg._arrived });\n  else node.warn('hold buffer full: dropping packets until reference data loads');\n  context.set('held', held);\n  node.status({ fill: 'yellow', shape: 'ring', text: 'holding ' + held.length + ' packet(s) until reference data loads' });\n  return null;\n}\nreturn handle(msg);\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 300,
+    "wires": [
+      [
+        "e_chitungwiza"
+      ],
+      [
+        "d_rej"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_chitungwiza"
+  },
+  {
+    "id": "e_chitungwiza",
+    "type": "function",
+    "name": "Evaluate: chitungwiza",
+    "func": "// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };// =============================================================================\n// EVALUATE: build telemetry rows and compare each reading with the cached baseline.\n// Runs at the edge, so faults are detected even while the uplink is down.\n//   ok -> warning (after WARN_CONFIRM consecutive readings) -> critical -> cleared\n// Critical alerts fire on the FIRST reading. One alert per state change, never per reading.\n// The fault type is diagnosed from the PATTERN across the packet's metrics, not from one metric:\n//   water : pressure low + flow high = leak (burst if both critical) | both low = supply_loss\n//           pressure low = low_pressure | pressure high = high_pressure | level = reservoir_low/high\n//   sewer : level high + flow low = blockage | level high + flow high = overflow\n//           level high alone = surcharge (warning) or overflow (critical) | flow high = infiltration\n// If the picture changes while a fault is open (e.g. low_pressure becomes a leak), the old type is\n// closed with a 'cleared' alert and the new one opened, so open faults never show stale types.\n// =============================================================================\nconst ref = global.get('reference');\nconst p = msg.payload, s = p.sensor;\nconst WARN_CONFIRM = Number(env.get('WARN_CONFIRM')) || 2;\nconst states = pget('alertState', {});\nconst rows = [];\n\nconst classify = (v, b) => v < b.cmin ? ['critical', 'low'] : v > b.cmax ? ['critical', 'high']\n                         : v < b.nmin ? ['warning', 'low'] : v > b.nmax ? ['warning', 'high'] : ['ok', null];\nconst lv = {};\nfor (const r of p.readings) {\n  const b = ref.baseline[s.type] && ref.baseline[s.type][r.metric];\n  if (b) { const [level, dir] = classify(r.value, b); lv[r.metric] = { level, dir }; }\n}\nconst out = (m, d) => !!lv[m] && lv[m].level !== 'ok' && lv[m].dir === d;     // metric outside normal in direction d\n\nfunction diagnose(metric) {\n  const d = lv[metric].dir;\n  if (s.type === 'water') {\n    if (metric === 'level') return d === 'low' ? 'reservoir_low' : 'reservoir_high';\n    if (metric === 'pressure' && d === 'high') return 'high_pressure';\n    const pLow = out('pressure', 'low'), fHigh = out('flow_rate', 'high'), fLow = out('flow_rate', 'low');\n    if (pLow && fHigh) return (lv.pressure.level === 'critical' && lv.flow_rate.level === 'critical') ? 'burst' : 'leak';\n    if (pLow && fLow) return 'supply_loss';\n    if (metric === 'pressure') return 'low_pressure';\n    return d === 'high' ? 'high_flow' : 'low_flow';\n  }\n  const lHigh = out('level', 'high'), fLow = out('flow_rate', 'low'), fHigh = out('flow_rate', 'high');\n  if (lHigh && fLow) return 'blockage';\n  if (lHigh && fHigh) return 'overflow';\n  if (metric === 'level') return d === 'high' ? (lv.level.level === 'critical' ? 'overflow' : 'surcharge') : 'low_level';\n  return d === 'high' ? 'infiltration' : 'low_flow';\n}\n\nfor (const r of p.readings) {\n  rows.push({ t: 'telemetry', r: { time: p.ts, sensor_id: p.sensor_id, metric_type: r.metric, value: r.value } });\n  if (s.suppressed || !lv[r.metric]) continue;                 // muted sensor: keep the data, raise nothing\n  const { level, dir } = lv[r.metric];\n  const b = ref.baseline[s.type][r.metric];\n  const key = p.sensor_id + '|' + r.metric;\n  const st = states[key] || { s: 'ok', n: 0, ft: null };\n\n  let emit = null;\n  if (level === 'critical') { if (st.s !== 'critical') emit = 'critical'; st.n = 0; }\n  else if (level === 'warning') {\n    if (st.s === 'critical') emit = 'warning';                 // improving, still outside normal\n    else if (st.s === 'ok') { st.n++; if (st.n >= WARN_CONFIRM) emit = 'warning'; }\n  } else { st.n = 0; if (st.s !== 'ok') emit = 'cleared'; }\n\n  if (emit === 'cleared') {\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft || 'out_of_range', severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reading back within normal range' } });\n    st.s = 'ok'; st.ft = null;\n  } else if (emit) {\n    const ft = diagnose(r.metric);\n    if (st.s !== 'ok' && st.ft && st.ft !== ft)                // picture changed: close the old type first\n      rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft, severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reclassified as ' + ft } });\n    const message = r.metric.replace('_', ' ') + ' ' + r.value + ' ' + (b.unit || '') + ' is ' + (dir === 'low' ? 'below' : 'above') + ' the ' + (emit === 'critical' ? 'critical' : 'normal') + ' limit (' + ft.replace('_', ' ') + ')';\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: p.trigger === 'threshold' ? 'sensor' : 'baseline', fault_type: ft, severity: emit, metric_type: r.metric, value: r.value, message } });\n    st.s = emit; st.ft = ft;\n  }\n  states[key] = st;\n}\nfor (const x of rows) x.r.edge_received_at = p.arrived;      // when the packet reached the edge\npset('alertState', states);\nnode.status({ fill: 'green', shape: 'dot', text: rows.some(x => x.t === 'alert') ? 'alert raised' : 'normal' });\nreturn { topic: 'data', payload: rows };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1820,
+    "y": 300,
+    "wires": [
+      [
+        "cl_chitungwiza"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_chitungwiza"
+  },
+  {
+    "id": "cl_chitungwiza",
+    "type": "function",
+    "name": "CLOUD LINK: chitungwiza",
+    "func": "// =============================================================================\n// CLOUD LINK, lane 'chitungwiza': this municipality's OWN uplink to the database.\n//   topic 'data' : array of {t:'telemetry'|'alert'|'edge_event', r:{row}}, micro-batched (BATCH_MS)\n//   topic 'tick' : flush + health check + replay of this lane's spool (every 30 s, or on demand)\n// Online  -> insert, one batched statement per table.\n// Offline -> append to spool/chitungwiza/current.ndjson (one JSON row per line, power-loss safe).\n// Restore -> replay oldest first in batches; inserts are idempotent (ON CONFLICT DO NOTHING).\n// Every lane has its own pool, spool and up/down state, so one municipality's outage never\n// delays another municipality's data.\n// =============================================================================\nconst LANE  = 'chitungwiza';\nconst DIR   = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\nconst SPOOL = path.join(DIR, 'spool', LANE);\nconst CUR   = path.join(SPOOL, 'current.ndjson');\nconst EDGE  = env.get('EDGE_ID') || 'hre-edge-01';\nconst BATCH = 500;\nconst WINDOW_MS = Number(env.get('BATCH_MS')) || 250;\nconst MAX_SPOOL = (Number(env.get('MAX_SPOOL_MB')) || 200) * 1024 * 1024;\nfs.mkdirSync(SPOOL, { recursive: true });\n\nconst pool    = global.get('hre_pool:' + LANE);\nconst UP      = 'uplink_ok:' + LANE;\nconst simDown = () => global.get('sim_uplink_down:' + LANE) === true || global.get('sim_uplink_down:all') === true;\nconst iso     = d => new Date(d).toISOString();\nconst ev      = (type, detail) => ({ t: 'edge_event', r: { time: iso(Date.now()), edge_id: EDGE, event_type: type, municipality: LANE === 'edge' ? null : LANE, ward_id: null, detail: detail ?? null } });\n\nconst SQL = {\n  telemetry: `INSERT INTO telemetry (time, sensor_id, metric_type, value, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.metric_type::metric_type_enum, x.value, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, metric_type text, value double precision, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  alert: `INSERT INTO alert (time, sensor_id, source, fault_type, severity, metric_type, value, message, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.source, x.fault_type, x.severity, x.metric_type::metric_type_enum, x.value, x.message, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, source text, fault_type text, severity text, metric_type text, value double precision, message text, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  fault_label: `INSERT INTO fault_label (time, event, sensor_id, kind, ramp_s, fault_start, fault_until, received_at)\n    SELECT x.time, x.event, x.sensor_id, x.kind, x.ramp_s, x.fault_start, x.fault_until, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, event text, sensor_id text, kind text, ramp_s double precision, fault_start timestamptz, fault_until timestamptz)\n    ON CONFLICT DO NOTHING`,\n  edge_event: `INSERT INTO edge_event (time, edge_id, event_type, municipality, ward_id, detail, received_at)\n    SELECT x.time, x.edge_id, x.event_type, x.municipality, x.ward_id, x.detail, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, edge_id text, event_type text, municipality text, ward_id int, detail jsonb)\n    ON CONFLICT DO NOTHING`\n};\n\nasync function send(rows) {\n  if (simDown()) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  for (const t of ['telemetry', 'alert', 'edge_event', 'fault_label']) {\n    const part = rows.filter(x => x.t === t).map(x => x.r);\n    for (let i = 0; i < part.length; i += BATCH)\n      await pool.query(SQL[t], [JSON.stringify(part.slice(i, i + BATCH))]);\n  }\n}\n\nconst spoolFiles = () => fs.readdirSync(SPOOL);\nconst spoolBytes = () => spoolFiles().reduce((n, f) => n + fs.statSync(path.join(SPOOL, f)).size, 0);\nconst replayFiles = () => spoolFiles().filter(f => f.startsWith('replay-')).sort();\nconst backlog = () => replayFiles().length > 0 || (fs.existsSync(CUR) && fs.statSync(CUR).size > 0);\n\nfunction spool(rows) {\n  if (spoolBytes() > MAX_SPOOL) {          // disk guard: keep alerts and events, drop telemetry\n    const n = rows.length;\n    rows = rows.filter(x => x.t !== 'telemetry');\n    node.warn(LANE + ': spool full (' + Math.round(MAX_SPOOL / 1048576) + ' MB): dropped ' + (n - rows.length) + ' telemetry rows');\n  }\n  if (rows.length) fs.appendFileSync(CUR, rows.map(x => JSON.stringify(x)).join('\\n') + '\\n');\n}\n\nfunction markDown(err) {\n  if (global.get(UP) !== false) {\n    global.set(UP, false);\n    spool([ev('uplink_down', { reason: String((err && err.message) || err).slice(0, 200) })]);\n  }\n}\nfunction markUp() {\n  const was = global.get(UP);\n  global.set(UP, true);\n  if (was === false) { spool([ev('uplink_up')]); return true; }\n  return false;\n}\n\nfunction status() {\n  const kb = Math.round(spoolBytes() / 1024);\n  if (global.get(UP) === false) node.status({ fill: 'red', shape: 'dot', text: LANE + ': uplink DOWN | spooled ' + kb + ' KB' });\n  else if (backlog()) node.status({ fill: 'yellow', shape: 'dot', text: LANE + ': syncing | ' + kb + ' KB queued' });\n  else node.status({ fill: 'green', shape: 'dot', text: LANE + ': uplink OK | queue empty' });\n}\n\nasync function flush() {\n  context.set('timer', 0);\n  const rows = context.get('buf') || [];\n  if (!rows.length) return;\n  context.set('buf', []);\n  if (!context.get('busy') && !backlog() && global.get(UP) !== false) {\n    try { await send(rows); markUp(); status(); return; } catch (e) { markDown(e); }\n  }\n  spool(rows);\n  status();\n}\n\nasync function replay() {\n  if (fs.existsSync(CUR) && fs.statSync(CUR).size > 0)\n    fs.renameSync(CUR, path.join(SPOOL, 'replay-' + Date.now() + '.ndjson'));\n  let total = 0, files = 0, oldest = null, newest = null;\n  const t0 = Date.now();\n  for (const f of replayFiles()) {\n    const full = path.join(SPOOL, f);\n    const rows = [];\n    for (const line of fs.readFileSync(full, 'utf8').split('\\n')) {\n      if (!line.trim()) continue;\n      try { rows.push(JSON.parse(line)); } catch (e) { /* torn last line after a power cut: skip */ }\n    }\n    try { await send(rows); } catch (e) { markDown(e); return false; }\n    fs.unlinkSync(full);\n    files++; total += rows.length;\n    for (const x of rows) if (x.t === 'telemetry' || x.t === 'alert') {\n      const tm = x.r.time;\n      if (!oldest || tm < oldest) oldest = tm;\n      if (!newest || tm > newest) newest = tm;\n    }\n  }\n  if (total > 0) {\n    const e = ev('sync_completed', { rows: total, files, oldest, newest, seconds: Math.round((Date.now() - t0) / 1000) });\n    try { await send([e]); } catch (err) { spool([e]); }\n  }\n  return true;\n}\n\nif (msg.topic === 'data') {\n  const rows = msg.payload;\n  if (!Array.isArray(rows) || !rows.length) return null;\n  const buf = context.get('buf') || [];\n  for (const r of rows) buf.push(r);\n  context.set('buf', buf);\n  if (buf.length >= BATCH) { await flush(); return null; }\n  const t = context.get('timer');\n  if (!t || Date.now() - t > 5000) {                 // collect simultaneous packets into one insert\n    context.set('timer', Date.now());\n    setTimeout(() => flush().catch(e => node.error(LANE + ': ' + e.message)), WINDOW_MS);\n  }\n  return null;\n}\n\nif (msg.topic === 'tick') {\n  await flush();\n  if (context.get('busy')) return null;\n  context.set('busy', true);\n  try {\n    try {\n      if (simDown()) throw new Error('simulated uplink down');\n      if (!pool) throw new Error('no database pool');\n      await pool.query('SELECT 1');\n    } catch (e) { markDown(e); status(); return null; }\n    const restored = markUp();\n    await replay();\n    status();\n    return restored ? [null, { topic: 'refresh', payload: 'uplink restored: ' + LANE }] : null;\n  } finally {\n    context.set('busy', false);\n  }\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool chitungwiza: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:chitungwiza', p);",
+    "finalize": "const p = global.get('hre_pool:chitungwiza');\nglobal.set('hre_pool:chitungwiza', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 300,
+    "wires": [
+      [],
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_chitungwiza"
+  },
+  {
+    "id": "g_chitungwiza",
+    "type": "group",
+    "name": "CHITUNGWIZA: water + sewer VLANs, own uplink",
+    "style": {
+      "label": true,
+      "stroke": "#1f77b4",
+      "fill": "#1f77b4",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "cl_chitungwiza",
+      "e_chitungwiza",
+      "m_in_chitungwiza",
+      "v_chitungwiza"
+    ],
+    "x": 1150,
+    "y": 245,
+    "w": 1180,
+    "h": 110,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_in_epworth",
+    "type": "mqtt in",
+    "name": "hre/telemetry/epworth/#",
+    "topic": "hre/telemetry/epworth/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 450,
+    "wires": [
+      [
+        "v_epworth"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_epworth"
+  },
+  {
+    "id": "v_epworth",
+    "type": "function",
+    "name": "Validate: epworth",
+    "func": "const LANE = 'epworth';\n// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };\n// =============================================================================\n// VALIDATE & FILTER. Input contract (same for the simulator and, later, MQTT):\n//   { \"sensor_id\": \"harare-water-01\", \"ts\": \"2026-10-10T12:00:00Z\",\n//     \"readings\": { \"pressure\": 3.1, \"flow_rate\": 12.4, \"level\": 71 } }\n// Output 1: clean packet. Output 2: rejected packet with a reason.\n// =============================================================================\nconst stats = flow.get('stats:' + LANE) || { ok: 0, rejected: 0, duplicates: 0, reasons: {} };\nconst PHYS = { pressure: [0, 25], flow_rate: [0, 500], level: [0, 100] };   // physically possible, not fault limits\nconst HOLD_MAX = 100000;\n\nfunction show() { node.status({ fill: stats.rejected ? 'yellow' : 'green', shape: 'dot', text: LANE + ' | ok ' + stats.ok + ' | rejected ' + stats.rejected + ' | dup ' + stats.duplicates }); }\n\nfunction handle(msg) {\n  const ref = global.get('reference');\n  const reject = (reason, detail) => {\n    stats.rejected++; stats.reasons[reason] = (stats.reasons[reason] || 0) + 1;\n    flow.set('stats:' + LANE, stats); show();\n    return [null, { payload: { reason, detail, packet: String(typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)).slice(0, 200) } }];\n  };\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return reject('bad_json'); } }\nif (!p || typeof p !== 'object' || Array.isArray(p)) return reject('bad_shape');\nif (!ref) return reject('no_reference_data');\nif (typeof p.sensor_id !== 'string' || !ref.sensors[p.sensor_id]) return reject('unknown_sensor', p.sensor_id);\nconst s = ref.sensors[p.sensor_id];\nif (!s.active) return reject('inactive_sensor', p.sensor_id);\nif (typeof msg.topic === 'string' && msg.topic.startsWith('hre/telemetry/')) {   // hre/telemetry/<municipality>/<sensor_id>\n  const parts = msg.topic.split('/');\n  if (parts.length !== 4) return reject('bad_topic', msg.topic);\n  if (parts[3] !== p.sensor_id) return reject('topic_sensor_mismatch', msg.topic);\n  if (s.muni && parts[2] !== s.muni) return reject('topic_municipality_mismatch', msg.topic);\n}\nif (!p.readings || typeof p.readings !== 'object') return reject('no_readings');\n\nlet ts = Date.now();\nif (p.ts !== undefined) ts = typeof p.ts === 'number' ? (p.ts < 1e12 ? p.ts * 1000 : p.ts) : Date.parse(p.ts);\nif (!Number.isFinite(ts)) return reject('bad_timestamp');\nif (ts > Date.now() + 5 * 60000) return reject('timestamp_in_future', p.ts);\nif (ts < Date.now() - 30 * 86400000) return reject('timestamp_too_old', p.ts);\nts = Math.round(ts / 1000) * 1000;\n\nconst seen = context.get('seen') || new Set();\nconst allowed = ref.baseline[s.type] || {};\nconst out = [], dropped = [];\nfor (const [metric, raw] of Object.entries(p.readings)) {\n  if (!allowed[metric]) { dropped.push('unknown_metric'); continue; }\n  const v = (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : raw;\n  if (typeof v !== 'number' || !Number.isFinite(v)) { dropped.push('not_numeric'); continue; }\n  const [lo, hi] = PHYS[metric] || [-Infinity, Infinity];\n  if (v < lo || v > hi) { dropped.push('implausible_value'); continue; }\n  const key = p.sensor_id + '|' + metric + '|' + ts;\n  if (seen.has(key)) { stats.duplicates++; dropped.push('duplicate'); continue; }\n  seen.add(key);\n  if (seen.size > 5000) seen.delete(seen.values().next().value);\n  out.push({ metric, value: Math.round(v * 1000) / 1000 });\n}\ncontext.set('seen', seen);\nif (!out.length) return reject(dropped[0] || 'no_valid_readings', p.sensor_id);\n\nconst ls = pget('lastSeen', {});\nls[p.sensor_id] = Math.max(ls[p.sensor_id] || 0, ts);\npset('lastSeen', ls);\n\nstats.ok++; flow.set('stats:' + LANE, stats); show();\nreturn [{ payload: { sensor_id: p.sensor_id, ts: new Date(ts).toISOString(), sensor: s, readings: out, arrived: new Date(msg._arrived || Date.now()).toISOString(), trigger: ['schedule', 'threshold', 'recovery'].includes(p.trigger) ? p.trigger : 'schedule' } }, null];\n}\n\n// Reference data (sensors + baseline) may not be loaded for a moment after a restart, exactly when\n// the broker delivers the backlog queued while we were down. Hold those packets, never drop them.\nif (msg.topic === 'release') {\n  const held = context.get('held') || [];\n  context.set('held', []);\n  const v = [], r = [];\n  for (const m of held) { const o = handle(m); if (o[0]) v.push(o[0]); if (o[1]) r.push(o[1]); }\n  if (held.length) node.log('reference data ready: released ' + held.length + ' held packet(s)');\n  return [v.length ? v : null, r.length ? r : null];\n}\nmsg._arrived = Date.now();                                   // when the packet reached the edge (kept while held)\nif (!global.get('reference')) {\n  const held = context.get('held') || [];\n  if (held.length < HOLD_MAX) held.push({ topic: msg.topic, payload: msg.payload, _arrived: msg._arrived });\n  else node.warn('hold buffer full: dropping packets until reference data loads');\n  context.set('held', held);\n  node.status({ fill: 'yellow', shape: 'ring', text: 'holding ' + held.length + ' packet(s) until reference data loads' });\n  return null;\n}\nreturn handle(msg);\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 450,
+    "wires": [
+      [
+        "e_epworth"
+      ],
+      [
+        "d_rej"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_epworth"
+  },
+  {
+    "id": "e_epworth",
+    "type": "function",
+    "name": "Evaluate: epworth",
+    "func": "// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };// =============================================================================\n// EVALUATE: build telemetry rows and compare each reading with the cached baseline.\n// Runs at the edge, so faults are detected even while the uplink is down.\n//   ok -> warning (after WARN_CONFIRM consecutive readings) -> critical -> cleared\n// Critical alerts fire on the FIRST reading. One alert per state change, never per reading.\n// The fault type is diagnosed from the PATTERN across the packet's metrics, not from one metric:\n//   water : pressure low + flow high = leak (burst if both critical) | both low = supply_loss\n//           pressure low = low_pressure | pressure high = high_pressure | level = reservoir_low/high\n//   sewer : level high + flow low = blockage | level high + flow high = overflow\n//           level high alone = surcharge (warning) or overflow (critical) | flow high = infiltration\n// If the picture changes while a fault is open (e.g. low_pressure becomes a leak), the old type is\n// closed with a 'cleared' alert and the new one opened, so open faults never show stale types.\n// =============================================================================\nconst ref = global.get('reference');\nconst p = msg.payload, s = p.sensor;\nconst WARN_CONFIRM = Number(env.get('WARN_CONFIRM')) || 2;\nconst states = pget('alertState', {});\nconst rows = [];\n\nconst classify = (v, b) => v < b.cmin ? ['critical', 'low'] : v > b.cmax ? ['critical', 'high']\n                         : v < b.nmin ? ['warning', 'low'] : v > b.nmax ? ['warning', 'high'] : ['ok', null];\nconst lv = {};\nfor (const r of p.readings) {\n  const b = ref.baseline[s.type] && ref.baseline[s.type][r.metric];\n  if (b) { const [level, dir] = classify(r.value, b); lv[r.metric] = { level, dir }; }\n}\nconst out = (m, d) => !!lv[m] && lv[m].level !== 'ok' && lv[m].dir === d;     // metric outside normal in direction d\n\nfunction diagnose(metric) {\n  const d = lv[metric].dir;\n  if (s.type === 'water') {\n    if (metric === 'level') return d === 'low' ? 'reservoir_low' : 'reservoir_high';\n    if (metric === 'pressure' && d === 'high') return 'high_pressure';\n    const pLow = out('pressure', 'low'), fHigh = out('flow_rate', 'high'), fLow = out('flow_rate', 'low');\n    if (pLow && fHigh) return (lv.pressure.level === 'critical' && lv.flow_rate.level === 'critical') ? 'burst' : 'leak';\n    if (pLow && fLow) return 'supply_loss';\n    if (metric === 'pressure') return 'low_pressure';\n    return d === 'high' ? 'high_flow' : 'low_flow';\n  }\n  const lHigh = out('level', 'high'), fLow = out('flow_rate', 'low'), fHigh = out('flow_rate', 'high');\n  if (lHigh && fLow) return 'blockage';\n  if (lHigh && fHigh) return 'overflow';\n  if (metric === 'level') return d === 'high' ? (lv.level.level === 'critical' ? 'overflow' : 'surcharge') : 'low_level';\n  return d === 'high' ? 'infiltration' : 'low_flow';\n}\n\nfor (const r of p.readings) {\n  rows.push({ t: 'telemetry', r: { time: p.ts, sensor_id: p.sensor_id, metric_type: r.metric, value: r.value } });\n  if (s.suppressed || !lv[r.metric]) continue;                 // muted sensor: keep the data, raise nothing\n  const { level, dir } = lv[r.metric];\n  const b = ref.baseline[s.type][r.metric];\n  const key = p.sensor_id + '|' + r.metric;\n  const st = states[key] || { s: 'ok', n: 0, ft: null };\n\n  let emit = null;\n  if (level === 'critical') { if (st.s !== 'critical') emit = 'critical'; st.n = 0; }\n  else if (level === 'warning') {\n    if (st.s === 'critical') emit = 'warning';                 // improving, still outside normal\n    else if (st.s === 'ok') { st.n++; if (st.n >= WARN_CONFIRM) emit = 'warning'; }\n  } else { st.n = 0; if (st.s !== 'ok') emit = 'cleared'; }\n\n  if (emit === 'cleared') {\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft || 'out_of_range', severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reading back within normal range' } });\n    st.s = 'ok'; st.ft = null;\n  } else if (emit) {\n    const ft = diagnose(r.metric);\n    if (st.s !== 'ok' && st.ft && st.ft !== ft)                // picture changed: close the old type first\n      rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft, severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reclassified as ' + ft } });\n    const message = r.metric.replace('_', ' ') + ' ' + r.value + ' ' + (b.unit || '') + ' is ' + (dir === 'low' ? 'below' : 'above') + ' the ' + (emit === 'critical' ? 'critical' : 'normal') + ' limit (' + ft.replace('_', ' ') + ')';\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: p.trigger === 'threshold' ? 'sensor' : 'baseline', fault_type: ft, severity: emit, metric_type: r.metric, value: r.value, message } });\n    st.s = emit; st.ft = ft;\n  }\n  states[key] = st;\n}\nfor (const x of rows) x.r.edge_received_at = p.arrived;      // when the packet reached the edge\npset('alertState', states);\nnode.status({ fill: 'green', shape: 'dot', text: rows.some(x => x.t === 'alert') ? 'alert raised' : 'normal' });\nreturn { topic: 'data', payload: rows };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1820,
+    "y": 450,
+    "wires": [
+      [
+        "cl_epworth"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_epworth"
+  },
+  {
+    "id": "cl_epworth",
+    "type": "function",
+    "name": "CLOUD LINK: epworth",
+    "func": "// =============================================================================\n// CLOUD LINK, lane 'epworth': this municipality's OWN uplink to the database.\n//   topic 'data' : array of {t:'telemetry'|'alert'|'edge_event', r:{row}}, micro-batched (BATCH_MS)\n//   topic 'tick' : flush + health check + replay of this lane's spool (every 30 s, or on demand)\n// Online  -> insert, one batched statement per table.\n// Offline -> append to spool/epworth/current.ndjson (one JSON row per line, power-loss safe).\n// Restore -> replay oldest first in batches; inserts are idempotent (ON CONFLICT DO NOTHING).\n// Every lane has its own pool, spool and up/down state, so one municipality's outage never\n// delays another municipality's data.\n// =============================================================================\nconst LANE  = 'epworth';\nconst DIR   = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\nconst SPOOL = path.join(DIR, 'spool', LANE);\nconst CUR   = path.join(SPOOL, 'current.ndjson');\nconst EDGE  = env.get('EDGE_ID') || 'hre-edge-01';\nconst BATCH = 500;\nconst WINDOW_MS = Number(env.get('BATCH_MS')) || 250;\nconst MAX_SPOOL = (Number(env.get('MAX_SPOOL_MB')) || 200) * 1024 * 1024;\nfs.mkdirSync(SPOOL, { recursive: true });\n\nconst pool    = global.get('hre_pool:' + LANE);\nconst UP      = 'uplink_ok:' + LANE;\nconst simDown = () => global.get('sim_uplink_down:' + LANE) === true || global.get('sim_uplink_down:all') === true;\nconst iso     = d => new Date(d).toISOString();\nconst ev      = (type, detail) => ({ t: 'edge_event', r: { time: iso(Date.now()), edge_id: EDGE, event_type: type, municipality: LANE === 'edge' ? null : LANE, ward_id: null, detail: detail ?? null } });\n\nconst SQL = {\n  telemetry: `INSERT INTO telemetry (time, sensor_id, metric_type, value, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.metric_type::metric_type_enum, x.value, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, metric_type text, value double precision, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  alert: `INSERT INTO alert (time, sensor_id, source, fault_type, severity, metric_type, value, message, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.source, x.fault_type, x.severity, x.metric_type::metric_type_enum, x.value, x.message, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, source text, fault_type text, severity text, metric_type text, value double precision, message text, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  fault_label: `INSERT INTO fault_label (time, event, sensor_id, kind, ramp_s, fault_start, fault_until, received_at)\n    SELECT x.time, x.event, x.sensor_id, x.kind, x.ramp_s, x.fault_start, x.fault_until, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, event text, sensor_id text, kind text, ramp_s double precision, fault_start timestamptz, fault_until timestamptz)\n    ON CONFLICT DO NOTHING`,\n  edge_event: `INSERT INTO edge_event (time, edge_id, event_type, municipality, ward_id, detail, received_at)\n    SELECT x.time, x.edge_id, x.event_type, x.municipality, x.ward_id, x.detail, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, edge_id text, event_type text, municipality text, ward_id int, detail jsonb)\n    ON CONFLICT DO NOTHING`\n};\n\nasync function send(rows) {\n  if (simDown()) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  for (const t of ['telemetry', 'alert', 'edge_event', 'fault_label']) {\n    const part = rows.filter(x => x.t === t).map(x => x.r);\n    for (let i = 0; i < part.length; i += BATCH)\n      await pool.query(SQL[t], [JSON.stringify(part.slice(i, i + BATCH))]);\n  }\n}\n\nconst spoolFiles = () => fs.readdirSync(SPOOL);\nconst spoolBytes = () => spoolFiles().reduce((n, f) => n + fs.statSync(path.join(SPOOL, f)).size, 0);\nconst replayFiles = () => spoolFiles().filter(f => f.startsWith('replay-')).sort();\nconst backlog = () => replayFiles().length > 0 || (fs.existsSync(CUR) && fs.statSync(CUR).size > 0);\n\nfunction spool(rows) {\n  if (spoolBytes() > MAX_SPOOL) {          // disk guard: keep alerts and events, drop telemetry\n    const n = rows.length;\n    rows = rows.filter(x => x.t !== 'telemetry');\n    node.warn(LANE + ': spool full (' + Math.round(MAX_SPOOL / 1048576) + ' MB): dropped ' + (n - rows.length) + ' telemetry rows');\n  }\n  if (rows.length) fs.appendFileSync(CUR, rows.map(x => JSON.stringify(x)).join('\\n') + '\\n');\n}\n\nfunction markDown(err) {\n  if (global.get(UP) !== false) {\n    global.set(UP, false);\n    spool([ev('uplink_down', { reason: String((err && err.message) || err).slice(0, 200) })]);\n  }\n}\nfunction markUp() {\n  const was = global.get(UP);\n  global.set(UP, true);\n  if (was === false) { spool([ev('uplink_up')]); return true; }\n  return false;\n}\n\nfunction status() {\n  const kb = Math.round(spoolBytes() / 1024);\n  if (global.get(UP) === false) node.status({ fill: 'red', shape: 'dot', text: LANE + ': uplink DOWN | spooled ' + kb + ' KB' });\n  else if (backlog()) node.status({ fill: 'yellow', shape: 'dot', text: LANE + ': syncing | ' + kb + ' KB queued' });\n  else node.status({ fill: 'green', shape: 'dot', text: LANE + ': uplink OK | queue empty' });\n}\n\nasync function flush() {\n  context.set('timer', 0);\n  const rows = context.get('buf') || [];\n  if (!rows.length) return;\n  context.set('buf', []);\n  if (!context.get('busy') && !backlog() && global.get(UP) !== false) {\n    try { await send(rows); markUp(); status(); return; } catch (e) { markDown(e); }\n  }\n  spool(rows);\n  status();\n}\n\nasync function replay() {\n  if (fs.existsSync(CUR) && fs.statSync(CUR).size > 0)\n    fs.renameSync(CUR, path.join(SPOOL, 'replay-' + Date.now() + '.ndjson'));\n  let total = 0, files = 0, oldest = null, newest = null;\n  const t0 = Date.now();\n  for (const f of replayFiles()) {\n    const full = path.join(SPOOL, f);\n    const rows = [];\n    for (const line of fs.readFileSync(full, 'utf8').split('\\n')) {\n      if (!line.trim()) continue;\n      try { rows.push(JSON.parse(line)); } catch (e) { /* torn last line after a power cut: skip */ }\n    }\n    try { await send(rows); } catch (e) { markDown(e); return false; }\n    fs.unlinkSync(full);\n    files++; total += rows.length;\n    for (const x of rows) if (x.t === 'telemetry' || x.t === 'alert') {\n      const tm = x.r.time;\n      if (!oldest || tm < oldest) oldest = tm;\n      if (!newest || tm > newest) newest = tm;\n    }\n  }\n  if (total > 0) {\n    const e = ev('sync_completed', { rows: total, files, oldest, newest, seconds: Math.round((Date.now() - t0) / 1000) });\n    try { await send([e]); } catch (err) { spool([e]); }\n  }\n  return true;\n}\n\nif (msg.topic === 'data') {\n  const rows = msg.payload;\n  if (!Array.isArray(rows) || !rows.length) return null;\n  const buf = context.get('buf') || [];\n  for (const r of rows) buf.push(r);\n  context.set('buf', buf);\n  if (buf.length >= BATCH) { await flush(); return null; }\n  const t = context.get('timer');\n  if (!t || Date.now() - t > 5000) {                 // collect simultaneous packets into one insert\n    context.set('timer', Date.now());\n    setTimeout(() => flush().catch(e => node.error(LANE + ': ' + e.message)), WINDOW_MS);\n  }\n  return null;\n}\n\nif (msg.topic === 'tick') {\n  await flush();\n  if (context.get('busy')) return null;\n  context.set('busy', true);\n  try {\n    try {\n      if (simDown()) throw new Error('simulated uplink down');\n      if (!pool) throw new Error('no database pool');\n      await pool.query('SELECT 1');\n    } catch (e) { markDown(e); status(); return null; }\n    const restored = markUp();\n    await replay();\n    status();\n    return restored ? [null, { topic: 'refresh', payload: 'uplink restored: ' + LANE }] : null;\n  } finally {\n    context.set('busy', false);\n  }\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool epworth: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:epworth', p);",
+    "finalize": "const p = global.get('hre_pool:epworth');\nglobal.set('hre_pool:epworth', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 450,
+    "wires": [
+      [],
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_epworth"
+  },
+  {
+    "id": "g_epworth",
+    "type": "group",
+    "name": "EPWORTH: water + sewer VLANs, own uplink",
+    "style": {
+      "label": true,
+      "stroke": "#1f77b4",
+      "fill": "#1f77b4",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "cl_epworth",
+      "e_epworth",
+      "m_in_epworth",
+      "v_epworth"
+    ],
+    "x": 1150,
+    "y": 395,
+    "w": 1180,
+    "h": 110,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_in_ruwa",
+    "type": "mqtt in",
+    "name": "hre/telemetry/ruwa/#",
+    "topic": "hre/telemetry/ruwa/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 600,
+    "wires": [
+      [
+        "v_ruwa"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_ruwa"
+  },
+  {
+    "id": "v_ruwa",
+    "type": "function",
+    "name": "Validate: ruwa",
+    "func": "const LANE = 'ruwa';\n// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };\n// =============================================================================\n// VALIDATE & FILTER. Input contract (same for the simulator and, later, MQTT):\n//   { \"sensor_id\": \"harare-water-01\", \"ts\": \"2026-10-10T12:00:00Z\",\n//     \"readings\": { \"pressure\": 3.1, \"flow_rate\": 12.4, \"level\": 71 } }\n// Output 1: clean packet. Output 2: rejected packet with a reason.\n// =============================================================================\nconst stats = flow.get('stats:' + LANE) || { ok: 0, rejected: 0, duplicates: 0, reasons: {} };\nconst PHYS = { pressure: [0, 25], flow_rate: [0, 500], level: [0, 100] };   // physically possible, not fault limits\nconst HOLD_MAX = 100000;\n\nfunction show() { node.status({ fill: stats.rejected ? 'yellow' : 'green', shape: 'dot', text: LANE + ' | ok ' + stats.ok + ' | rejected ' + stats.rejected + ' | dup ' + stats.duplicates }); }\n\nfunction handle(msg) {\n  const ref = global.get('reference');\n  const reject = (reason, detail) => {\n    stats.rejected++; stats.reasons[reason] = (stats.reasons[reason] || 0) + 1;\n    flow.set('stats:' + LANE, stats); show();\n    return [null, { payload: { reason, detail, packet: String(typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)).slice(0, 200) } }];\n  };\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return reject('bad_json'); } }\nif (!p || typeof p !== 'object' || Array.isArray(p)) return reject('bad_shape');\nif (!ref) return reject('no_reference_data');\nif (typeof p.sensor_id !== 'string' || !ref.sensors[p.sensor_id]) return reject('unknown_sensor', p.sensor_id);\nconst s = ref.sensors[p.sensor_id];\nif (!s.active) return reject('inactive_sensor', p.sensor_id);\nif (typeof msg.topic === 'string' && msg.topic.startsWith('hre/telemetry/')) {   // hre/telemetry/<municipality>/<sensor_id>\n  const parts = msg.topic.split('/');\n  if (parts.length !== 4) return reject('bad_topic', msg.topic);\n  if (parts[3] !== p.sensor_id) return reject('topic_sensor_mismatch', msg.topic);\n  if (s.muni && parts[2] !== s.muni) return reject('topic_municipality_mismatch', msg.topic);\n}\nif (!p.readings || typeof p.readings !== 'object') return reject('no_readings');\n\nlet ts = Date.now();\nif (p.ts !== undefined) ts = typeof p.ts === 'number' ? (p.ts < 1e12 ? p.ts * 1000 : p.ts) : Date.parse(p.ts);\nif (!Number.isFinite(ts)) return reject('bad_timestamp');\nif (ts > Date.now() + 5 * 60000) return reject('timestamp_in_future', p.ts);\nif (ts < Date.now() - 30 * 86400000) return reject('timestamp_too_old', p.ts);\nts = Math.round(ts / 1000) * 1000;\n\nconst seen = context.get('seen') || new Set();\nconst allowed = ref.baseline[s.type] || {};\nconst out = [], dropped = [];\nfor (const [metric, raw] of Object.entries(p.readings)) {\n  if (!allowed[metric]) { dropped.push('unknown_metric'); continue; }\n  const v = (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : raw;\n  if (typeof v !== 'number' || !Number.isFinite(v)) { dropped.push('not_numeric'); continue; }\n  const [lo, hi] = PHYS[metric] || [-Infinity, Infinity];\n  if (v < lo || v > hi) { dropped.push('implausible_value'); continue; }\n  const key = p.sensor_id + '|' + metric + '|' + ts;\n  if (seen.has(key)) { stats.duplicates++; dropped.push('duplicate'); continue; }\n  seen.add(key);\n  if (seen.size > 5000) seen.delete(seen.values().next().value);\n  out.push({ metric, value: Math.round(v * 1000) / 1000 });\n}\ncontext.set('seen', seen);\nif (!out.length) return reject(dropped[0] || 'no_valid_readings', p.sensor_id);\n\nconst ls = pget('lastSeen', {});\nls[p.sensor_id] = Math.max(ls[p.sensor_id] || 0, ts);\npset('lastSeen', ls);\n\nstats.ok++; flow.set('stats:' + LANE, stats); show();\nreturn [{ payload: { sensor_id: p.sensor_id, ts: new Date(ts).toISOString(), sensor: s, readings: out, arrived: new Date(msg._arrived || Date.now()).toISOString(), trigger: ['schedule', 'threshold', 'recovery'].includes(p.trigger) ? p.trigger : 'schedule' } }, null];\n}\n\n// Reference data (sensors + baseline) may not be loaded for a moment after a restart, exactly when\n// the broker delivers the backlog queued while we were down. Hold those packets, never drop them.\nif (msg.topic === 'release') {\n  const held = context.get('held') || [];\n  context.set('held', []);\n  const v = [], r = [];\n  for (const m of held) { const o = handle(m); if (o[0]) v.push(o[0]); if (o[1]) r.push(o[1]); }\n  if (held.length) node.log('reference data ready: released ' + held.length + ' held packet(s)');\n  return [v.length ? v : null, r.length ? r : null];\n}\nmsg._arrived = Date.now();                                   // when the packet reached the edge (kept while held)\nif (!global.get('reference')) {\n  const held = context.get('held') || [];\n  if (held.length < HOLD_MAX) held.push({ topic: msg.topic, payload: msg.payload, _arrived: msg._arrived });\n  else node.warn('hold buffer full: dropping packets until reference data loads');\n  context.set('held', held);\n  node.status({ fill: 'yellow', shape: 'ring', text: 'holding ' + held.length + ' packet(s) until reference data loads' });\n  return null;\n}\nreturn handle(msg);\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 600,
+    "wires": [
+      [
+        "e_ruwa"
+      ],
+      [
+        "d_rej"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_ruwa"
+  },
+  {
+    "id": "e_ruwa",
+    "type": "function",
+    "name": "Evaluate: ruwa",
+    "func": "// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };// =============================================================================\n// EVALUATE: build telemetry rows and compare each reading with the cached baseline.\n// Runs at the edge, so faults are detected even while the uplink is down.\n//   ok -> warning (after WARN_CONFIRM consecutive readings) -> critical -> cleared\n// Critical alerts fire on the FIRST reading. One alert per state change, never per reading.\n// The fault type is diagnosed from the PATTERN across the packet's metrics, not from one metric:\n//   water : pressure low + flow high = leak (burst if both critical) | both low = supply_loss\n//           pressure low = low_pressure | pressure high = high_pressure | level = reservoir_low/high\n//   sewer : level high + flow low = blockage | level high + flow high = overflow\n//           level high alone = surcharge (warning) or overflow (critical) | flow high = infiltration\n// If the picture changes while a fault is open (e.g. low_pressure becomes a leak), the old type is\n// closed with a 'cleared' alert and the new one opened, so open faults never show stale types.\n// =============================================================================\nconst ref = global.get('reference');\nconst p = msg.payload, s = p.sensor;\nconst WARN_CONFIRM = Number(env.get('WARN_CONFIRM')) || 2;\nconst states = pget('alertState', {});\nconst rows = [];\n\nconst classify = (v, b) => v < b.cmin ? ['critical', 'low'] : v > b.cmax ? ['critical', 'high']\n                         : v < b.nmin ? ['warning', 'low'] : v > b.nmax ? ['warning', 'high'] : ['ok', null];\nconst lv = {};\nfor (const r of p.readings) {\n  const b = ref.baseline[s.type] && ref.baseline[s.type][r.metric];\n  if (b) { const [level, dir] = classify(r.value, b); lv[r.metric] = { level, dir }; }\n}\nconst out = (m, d) => !!lv[m] && lv[m].level !== 'ok' && lv[m].dir === d;     // metric outside normal in direction d\n\nfunction diagnose(metric) {\n  const d = lv[metric].dir;\n  if (s.type === 'water') {\n    if (metric === 'level') return d === 'low' ? 'reservoir_low' : 'reservoir_high';\n    if (metric === 'pressure' && d === 'high') return 'high_pressure';\n    const pLow = out('pressure', 'low'), fHigh = out('flow_rate', 'high'), fLow = out('flow_rate', 'low');\n    if (pLow && fHigh) return (lv.pressure.level === 'critical' && lv.flow_rate.level === 'critical') ? 'burst' : 'leak';\n    if (pLow && fLow) return 'supply_loss';\n    if (metric === 'pressure') return 'low_pressure';\n    return d === 'high' ? 'high_flow' : 'low_flow';\n  }\n  const lHigh = out('level', 'high'), fLow = out('flow_rate', 'low'), fHigh = out('flow_rate', 'high');\n  if (lHigh && fLow) return 'blockage';\n  if (lHigh && fHigh) return 'overflow';\n  if (metric === 'level') return d === 'high' ? (lv.level.level === 'critical' ? 'overflow' : 'surcharge') : 'low_level';\n  return d === 'high' ? 'infiltration' : 'low_flow';\n}\n\nfor (const r of p.readings) {\n  rows.push({ t: 'telemetry', r: { time: p.ts, sensor_id: p.sensor_id, metric_type: r.metric, value: r.value } });\n  if (s.suppressed || !lv[r.metric]) continue;                 // muted sensor: keep the data, raise nothing\n  const { level, dir } = lv[r.metric];\n  const b = ref.baseline[s.type][r.metric];\n  const key = p.sensor_id + '|' + r.metric;\n  const st = states[key] || { s: 'ok', n: 0, ft: null };\n\n  let emit = null;\n  if (level === 'critical') { if (st.s !== 'critical') emit = 'critical'; st.n = 0; }\n  else if (level === 'warning') {\n    if (st.s === 'critical') emit = 'warning';                 // improving, still outside normal\n    else if (st.s === 'ok') { st.n++; if (st.n >= WARN_CONFIRM) emit = 'warning'; }\n  } else { st.n = 0; if (st.s !== 'ok') emit = 'cleared'; }\n\n  if (emit === 'cleared') {\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft || 'out_of_range', severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reading back within normal range' } });\n    st.s = 'ok'; st.ft = null;\n  } else if (emit) {\n    const ft = diagnose(r.metric);\n    if (st.s !== 'ok' && st.ft && st.ft !== ft)                // picture changed: close the old type first\n      rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: 'baseline', fault_type: st.ft, severity: 'cleared', metric_type: r.metric, value: r.value, message: 'Reclassified as ' + ft } });\n    const message = r.metric.replace('_', ' ') + ' ' + r.value + ' ' + (b.unit || '') + ' is ' + (dir === 'low' ? 'below' : 'above') + ' the ' + (emit === 'critical' ? 'critical' : 'normal') + ' limit (' + ft.replace('_', ' ') + ')';\n    rows.push({ t: 'alert', r: { time: p.ts, sensor_id: p.sensor_id, source: p.trigger === 'threshold' ? 'sensor' : 'baseline', fault_type: ft, severity: emit, metric_type: r.metric, value: r.value, message } });\n    st.s = emit; st.ft = ft;\n  }\n  states[key] = st;\n}\nfor (const x of rows) x.r.edge_received_at = p.arrived;      // when the packet reached the edge\npset('alertState', states);\nnode.status({ fill: 'green', shape: 'dot', text: rows.some(x => x.t === 'alert') ? 'alert raised' : 'normal' });\nreturn { topic: 'data', payload: rows };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1820,
+    "y": 600,
+    "wires": [
+      [
+        "cl_ruwa"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_ruwa"
+  },
+  {
+    "id": "cl_ruwa",
+    "type": "function",
+    "name": "CLOUD LINK: ruwa",
+    "func": "// =============================================================================\n// CLOUD LINK, lane 'ruwa': this municipality's OWN uplink to the database.\n//   topic 'data' : array of {t:'telemetry'|'alert'|'edge_event', r:{row}}, micro-batched (BATCH_MS)\n//   topic 'tick' : flush + health check + replay of this lane's spool (every 30 s, or on demand)\n// Online  -> insert, one batched statement per table.\n// Offline -> append to spool/ruwa/current.ndjson (one JSON row per line, power-loss safe).\n// Restore -> replay oldest first in batches; inserts are idempotent (ON CONFLICT DO NOTHING).\n// Every lane has its own pool, spool and up/down state, so one municipality's outage never\n// delays another municipality's data.\n// =============================================================================\nconst LANE  = 'ruwa';\nconst DIR   = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\nconst SPOOL = path.join(DIR, 'spool', LANE);\nconst CUR   = path.join(SPOOL, 'current.ndjson');\nconst EDGE  = env.get('EDGE_ID') || 'hre-edge-01';\nconst BATCH = 500;\nconst WINDOW_MS = Number(env.get('BATCH_MS')) || 250;\nconst MAX_SPOOL = (Number(env.get('MAX_SPOOL_MB')) || 200) * 1024 * 1024;\nfs.mkdirSync(SPOOL, { recursive: true });\n\nconst pool    = global.get('hre_pool:' + LANE);\nconst UP      = 'uplink_ok:' + LANE;\nconst simDown = () => global.get('sim_uplink_down:' + LANE) === true || global.get('sim_uplink_down:all') === true;\nconst iso     = d => new Date(d).toISOString();\nconst ev      = (type, detail) => ({ t: 'edge_event', r: { time: iso(Date.now()), edge_id: EDGE, event_type: type, municipality: LANE === 'edge' ? null : LANE, ward_id: null, detail: detail ?? null } });\n\nconst SQL = {\n  telemetry: `INSERT INTO telemetry (time, sensor_id, metric_type, value, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.metric_type::metric_type_enum, x.value, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, metric_type text, value double precision, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  alert: `INSERT INTO alert (time, sensor_id, source, fault_type, severity, metric_type, value, message, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.source, x.fault_type, x.severity, x.metric_type::metric_type_enum, x.value, x.message, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, source text, fault_type text, severity text, metric_type text, value double precision, message text, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  fault_label: `INSERT INTO fault_label (time, event, sensor_id, kind, ramp_s, fault_start, fault_until, received_at)\n    SELECT x.time, x.event, x.sensor_id, x.kind, x.ramp_s, x.fault_start, x.fault_until, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, event text, sensor_id text, kind text, ramp_s double precision, fault_start timestamptz, fault_until timestamptz)\n    ON CONFLICT DO NOTHING`,\n  edge_event: `INSERT INTO edge_event (time, edge_id, event_type, municipality, ward_id, detail, received_at)\n    SELECT x.time, x.edge_id, x.event_type, x.municipality, x.ward_id, x.detail, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, edge_id text, event_type text, municipality text, ward_id int, detail jsonb)\n    ON CONFLICT DO NOTHING`\n};\n\nasync function send(rows) {\n  if (simDown()) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  for (const t of ['telemetry', 'alert', 'edge_event', 'fault_label']) {\n    const part = rows.filter(x => x.t === t).map(x => x.r);\n    for (let i = 0; i < part.length; i += BATCH)\n      await pool.query(SQL[t], [JSON.stringify(part.slice(i, i + BATCH))]);\n  }\n}\n\nconst spoolFiles = () => fs.readdirSync(SPOOL);\nconst spoolBytes = () => spoolFiles().reduce((n, f) => n + fs.statSync(path.join(SPOOL, f)).size, 0);\nconst replayFiles = () => spoolFiles().filter(f => f.startsWith('replay-')).sort();\nconst backlog = () => replayFiles().length > 0 || (fs.existsSync(CUR) && fs.statSync(CUR).size > 0);\n\nfunction spool(rows) {\n  if (spoolBytes() > MAX_SPOOL) {          // disk guard: keep alerts and events, drop telemetry\n    const n = rows.length;\n    rows = rows.filter(x => x.t !== 'telemetry');\n    node.warn(LANE + ': spool full (' + Math.round(MAX_SPOOL / 1048576) + ' MB): dropped ' + (n - rows.length) + ' telemetry rows');\n  }\n  if (rows.length) fs.appendFileSync(CUR, rows.map(x => JSON.stringify(x)).join('\\n') + '\\n');\n}\n\nfunction markDown(err) {\n  if (global.get(UP) !== false) {\n    global.set(UP, false);\n    spool([ev('uplink_down', { reason: String((err && err.message) || err).slice(0, 200) })]);\n  }\n}\nfunction markUp() {\n  const was = global.get(UP);\n  global.set(UP, true);\n  if (was === false) { spool([ev('uplink_up')]); return true; }\n  return false;\n}\n\nfunction status() {\n  const kb = Math.round(spoolBytes() / 1024);\n  if (global.get(UP) === false) node.status({ fill: 'red', shape: 'dot', text: LANE + ': uplink DOWN | spooled ' + kb + ' KB' });\n  else if (backlog()) node.status({ fill: 'yellow', shape: 'dot', text: LANE + ': syncing | ' + kb + ' KB queued' });\n  else node.status({ fill: 'green', shape: 'dot', text: LANE + ': uplink OK | queue empty' });\n}\n\nasync function flush() {\n  context.set('timer', 0);\n  const rows = context.get('buf') || [];\n  if (!rows.length) return;\n  context.set('buf', []);\n  if (!context.get('busy') && !backlog() && global.get(UP) !== false) {\n    try { await send(rows); markUp(); status(); return; } catch (e) { markDown(e); }\n  }\n  spool(rows);\n  status();\n}\n\nasync function replay() {\n  if (fs.existsSync(CUR) && fs.statSync(CUR).size > 0)\n    fs.renameSync(CUR, path.join(SPOOL, 'replay-' + Date.now() + '.ndjson'));\n  let total = 0, files = 0, oldest = null, newest = null;\n  const t0 = Date.now();\n  for (const f of replayFiles()) {\n    const full = path.join(SPOOL, f);\n    const rows = [];\n    for (const line of fs.readFileSync(full, 'utf8').split('\\n')) {\n      if (!line.trim()) continue;\n      try { rows.push(JSON.parse(line)); } catch (e) { /* torn last line after a power cut: skip */ }\n    }\n    try { await send(rows); } catch (e) { markDown(e); return false; }\n    fs.unlinkSync(full);\n    files++; total += rows.length;\n    for (const x of rows) if (x.t === 'telemetry' || x.t === 'alert') {\n      const tm = x.r.time;\n      if (!oldest || tm < oldest) oldest = tm;\n      if (!newest || tm > newest) newest = tm;\n    }\n  }\n  if (total > 0) {\n    const e = ev('sync_completed', { rows: total, files, oldest, newest, seconds: Math.round((Date.now() - t0) / 1000) });\n    try { await send([e]); } catch (err) { spool([e]); }\n  }\n  return true;\n}\n\nif (msg.topic === 'data') {\n  const rows = msg.payload;\n  if (!Array.isArray(rows) || !rows.length) return null;\n  const buf = context.get('buf') || [];\n  for (const r of rows) buf.push(r);\n  context.set('buf', buf);\n  if (buf.length >= BATCH) { await flush(); return null; }\n  const t = context.get('timer');\n  if (!t || Date.now() - t > 5000) {                 // collect simultaneous packets into one insert\n    context.set('timer', Date.now());\n    setTimeout(() => flush().catch(e => node.error(LANE + ': ' + e.message)), WINDOW_MS);\n  }\n  return null;\n}\n\nif (msg.topic === 'tick') {\n  await flush();\n  if (context.get('busy')) return null;\n  context.set('busy', true);\n  try {\n    try {\n      if (simDown()) throw new Error('simulated uplink down');\n      if (!pool) throw new Error('no database pool');\n      await pool.query('SELECT 1');\n    } catch (e) { markDown(e); status(); return null; }\n    const restored = markUp();\n    await replay();\n    status();\n    return restored ? [null, { topic: 'refresh', payload: 'uplink restored: ' + LANE }] : null;\n  } finally {\n    context.set('busy', false);\n  }\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool ruwa: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:ruwa', p);",
+    "finalize": "const p = global.get('hre_pool:ruwa');\nglobal.set('hre_pool:ruwa', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 600,
+    "wires": [
+      [],
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_ruwa"
+  },
+  {
+    "id": "g_ruwa",
+    "type": "group",
+    "name": "RUWA: water + sewer VLANs, own uplink",
+    "style": {
+      "label": true,
+      "stroke": "#1f77b4",
+      "fill": "#1f77b4",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "cl_ruwa",
+      "e_ruwa",
+      "m_in_ruwa",
+      "v_ruwa"
+    ],
+    "x": 1150,
+    "y": 545,
+    "w": 1180,
+    "h": 110,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "f_power",
+    "type": "function",
+    "name": "Edge power state",
+    "func": "// POWER STATE. Today: manual inject. Later: an MQTT topic (e.g. hre/<site>/power),\n// a UPS feed (NUT) or a mains-detect GPIO. Accepts 'on'/'off' or {grid:true|false}.\nconst EDGE = env.get('EDGE_ID') || 'hre-edge-01';\nconst v = (msg.payload && typeof msg.payload === 'object') ? msg.payload.grid : msg.payload;\nconst gridOk = (v === true || v === 'on' || v === 'ok' || v === 1);\nconst prev = global.get('grid_ok');\nglobal.set('grid_ok', gridOk);\nnode.status({ fill: gridOk ? 'green' : 'red', shape: 'dot', text: gridOk ? 'grid power OK' : 'ON BATTERY / LOADSHEDDING' });\nif (prev === gridOk || (prev === undefined && gridOk)) return null;\nreturn { topic: 'data', payload: [{ t: 'edge_event', r: { time: new Date().toISOString(), edge_id: EDGE, event_type: gridOk ? 'power_restored' : 'power_loss', ward_id: null, detail: { source: msg.topic || 'manual' } } }] };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 770,
+    "wires": [
+      [
+        "cl_edge"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_edge"
+  },
+  {
+    "id": "f_wd",
+    "type": "function",
+    "name": "Watchdog (offline + ward/municipality/province outage)",
+    "func": "// persistent context with fallback to memory if no 'file' store is configured\nconst pget = (k, d) => { try { const v = flow.get(k, 'file'); return v === undefined ? d : v; } catch (e) { const v = flow.get(k); return v === undefined ? d : v; } };\nconst pset = (k, v) => { try { flow.set(k, v, 'file'); } catch (e) { flow.set(k, v); } };\n// =============================================================================\n// WATCHDOG (runs every 60 s). Works out WHO is silent and, from the pattern, WHY:\n//   one sensor silent                 -> 'offline' alert (device or comms fault)\n//   every sensor in a ward silent     -> 'ward_outage_suspected'         (loadshedding)\n//   every sensor in a municipality    -> 'municipality_outage_suspected'\n//   every sensor in the province      -> 'province_outage_suspected'\n// Only the HIGHEST level is announced, so a province outage is one event, not 25.\n// A grace period after Node-RED starts avoids false alarms right after a reboot.\n// =============================================================================\nconst ref = global.get('reference');\nif (!ref) return null;\nconst EDGE = env.get('EDGE_ID') || 'hre-edge-01';\nconst OFFLINE_MS = (Number(env.get('OFFLINE_AFTER_MIN')) || 15) * 60000;\nlet t0 = context.get('t0');\nif (!t0) { t0 = Date.now(); context.set('t0', t0); }\nif (Date.now() - t0 < OFFLINE_MS) { node.status({ fill: 'grey', shape: 'ring', text: 'grace period after start' }); return null; }\n\nconst now = Date.now(), iso = d => new Date(d).toISOString();\nconst ls = pget('lastSeen', {}), wd = pget('wdState', {});\nconst rows = [], wards = {}, munis = {};\nlet pTotal = 0, pSilent = 0;\nlet seq = 0;   // +1 ms per event: simultaneous events of one type must not collide on the unique (edge_id, event_type, time) key\nconst event = (type, wardId, detail) => rows.push({ t: 'edge_event', r: { time: iso(now + seq++), edge_id: EDGE, event_type: type, ward_id: wardId, municipality: (detail && detail.municipality) || null, detail } });\n\nfor (const [id, s] of Object.entries(ref.sensors)) {\n  if (!s.active || s.suppressed) continue;\n  const last = ls[id] ?? t0;\n  const silent = now - last > OFFLINE_MS;\n  const w = (wards[s.ward_id] ??= { ids: [], silent: 0, muni: s.muni, num: s.ward_number });\n  w.ids.push(id); if (silent) w.silent++;\n  const m = (munis[s.muni] ??= { ids: 0, silent: 0, wards: new Set() });\n  m.ids++; m.wards.add(s.ward_id); if (silent) m.silent++;\n  pTotal++; if (silent) pSilent++;\n  if (silent && !wd[id]) {\n    wd[id] = 1;\n    rows.push({ t: 'alert', r: { time: iso(now), sensor_id: id, source: 'watchdog', fault_type: 'offline', severity: 'critical', metric_type: null, value: null, message: 'No data for ' + Math.round((now - last) / 60000) + ' min' } });\n  } else if (!silent && wd[id]) {\n    delete wd[id];\n    rows.push({ t: 'alert', r: { time: iso(last), sensor_id: id, source: 'watchdog', fault_type: 'offline', severity: 'cleared', metric_type: null, value: null, message: 'Sensor reporting again' } });\n  }\n}\n\n// state per scope: 1 = announced, 2 = silent but covered by a higher-level announcement\nfunction scope(key, cond, parentCond, restoreCond, announceType, restoreType, wardId, detail) {\n  const st = wd[key], announce = cond && !parentCond;\n  if (cond && !st) { wd[key] = announce ? 1 : 2; if (announce) event(announceType, wardId, detail); }\n  else if (st === 2 && announce) { wd[key] = 1; event(announceType, wardId, detail); }\n  else if (st && restoreCond) { if (st === 1) event(restoreType, wardId, detail && detail.municipality ? { municipality: detail.municipality } : null); delete wd[key]; }\n}\n\nconst provCond = pTotal >= 2 && Object.keys(munis).length >= 2 && pSilent === pTotal;\nscope('prov', provCond, false, !provCond, 'province_outage_suspected', 'province_restored', null,\n  { sensors: pTotal, hint: 'every sensor in the province went silent together (province-wide loadshedding or core network failure)' });\n\nconst muniCond = {};\nfor (const [slug, m] of Object.entries(munis)) {\n  muniCond[slug] = m.wards.size >= 2 && m.silent === m.ids;\n  scope('muni:' + slug, muniCond[slug], provCond, !muniCond[slug], 'municipality_outage_suspected', 'municipality_restored', null,\n    { municipality: slug, sensors: m.ids, hint: 'every sensor in the municipality went silent together (loadshedding)' });\n}\nfor (const [wid, g] of Object.entries(wards)) {\n  const cond = g.ids.length >= 2 && g.silent === g.ids.length;\n  scope('ward' + wid, cond, provCond || muniCond[g.muni], g.silent === 0, 'ward_outage_suspected', 'ward_restored', Number(wid),\n    { municipality: g.muni, ward: g.num, sensors: g.ids, hint: 'all sensors in the ward went silent together (loadshedding pattern)' });\n}\n\npset('wdState', wd);\nconst flagged = Object.keys(wd).filter(k => /^[a-z]+-(water|sewer)-/.test(k)).length;\nconst top = wd.prov === 1 ? 'PROVINCE outage' : Object.keys(wd).some(k => k.startsWith('muni:') && wd[k] === 1) ? 'municipality outage' : null;\nnode.status({ fill: flagged ? 'red' : 'green', shape: 'dot', text: (top ? top + ' | ' : '') + flagged + ' sensor(s) silent' });\nfor (const r of rows) if (r.t === 'alert') r.r.edge_received_at = iso(now);   // created at the edge\n// route every row to the lane that owns it: sensors -> their municipality, province/edge events -> 'edge'\nconst LANES = ['harare', 'chitungwiza', 'epworth', 'ruwa', 'edge'];\nconst routed = LANES.map(() => []);\nfor (const r of rows) {\n  const m = r.t === 'alert' ? (ref.sensors[r.r.sensor_id] || {}).muni : r.r.municipality;\n  const i = LANES.indexOf(m);\n  routed[i < 0 ? LANES.length - 1 : i].push(r);\n}\nconst outMsgs = routed.map(a => a.length ? { topic: 'data', payload: a } : null);\nreturn outMsgs.some(Boolean) ? outMsgs : null;\n",
+    "outputs": 5,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "context.set('t0', Date.now());",
+    "finalize": "",
+    "libs": [],
+    "x": 1820,
+    "y": 770,
+    "wires": [
+      [
+        "cl_harare"
+      ],
+      [
+        "cl_chitungwiza"
+      ],
+      [
+        "cl_epworth"
+      ],
+      [
+        "cl_ruwa"
+      ],
+      [
+        "cl_edge"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_edge"
+  },
+  {
+    "id": "cl_edge",
+    "type": "function",
+    "name": "CLOUD LINK: edge",
+    "func": "// =============================================================================\n// CLOUD LINK, lane 'edge': this municipality's OWN uplink to the database.\n//   topic 'data' : array of {t:'telemetry'|'alert'|'edge_event', r:{row}}, micro-batched (BATCH_MS)\n//   topic 'tick' : flush + health check + replay of this lane's spool (every 30 s, or on demand)\n// Online  -> insert, one batched statement per table.\n// Offline -> append to spool/edge/current.ndjson (one JSON row per line, power-loss safe).\n// Restore -> replay oldest first in batches; inserts are idempotent (ON CONFLICT DO NOTHING).\n// Every lane has its own pool, spool and up/down state, so one municipality's outage never\n// delays another municipality's data.\n// =============================================================================\nconst LANE  = 'edge';\nconst DIR   = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\nconst SPOOL = path.join(DIR, 'spool', LANE);\nconst CUR   = path.join(SPOOL, 'current.ndjson');\nconst EDGE  = env.get('EDGE_ID') || 'hre-edge-01';\nconst BATCH = 500;\nconst WINDOW_MS = Number(env.get('BATCH_MS')) || 250;\nconst MAX_SPOOL = (Number(env.get('MAX_SPOOL_MB')) || 200) * 1024 * 1024;\nfs.mkdirSync(SPOOL, { recursive: true });\n\nconst pool    = global.get('hre_pool:' + LANE);\nconst UP      = 'uplink_ok:' + LANE;\nconst simDown = () => global.get('sim_uplink_down:' + LANE) === true || global.get('sim_uplink_down:all') === true;\nconst iso     = d => new Date(d).toISOString();\nconst ev      = (type, detail) => ({ t: 'edge_event', r: { time: iso(Date.now()), edge_id: EDGE, event_type: type, municipality: LANE === 'edge' ? null : LANE, ward_id: null, detail: detail ?? null } });\n\nconst SQL = {\n  telemetry: `INSERT INTO telemetry (time, sensor_id, metric_type, value, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.metric_type::metric_type_enum, x.value, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, metric_type text, value double precision, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  alert: `INSERT INTO alert (time, sensor_id, source, fault_type, severity, metric_type, value, message, edge_received_at, received_at)\n    SELECT x.time, x.sensor_id, x.source, x.fault_type, x.severity, x.metric_type::metric_type_enum, x.value, x.message, x.edge_received_at, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, sensor_id text, source text, fault_type text, severity text, metric_type text, value double precision, message text, edge_received_at timestamptz)\n    ON CONFLICT DO NOTHING`,\n  fault_label: `INSERT INTO fault_label (time, event, sensor_id, kind, ramp_s, fault_start, fault_until, received_at)\n    SELECT x.time, x.event, x.sensor_id, x.kind, x.ramp_s, x.fault_start, x.fault_until, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, event text, sensor_id text, kind text, ramp_s double precision, fault_start timestamptz, fault_until timestamptz)\n    ON CONFLICT DO NOTHING`,\n  edge_event: `INSERT INTO edge_event (time, edge_id, event_type, municipality, ward_id, detail, received_at)\n    SELECT x.time, x.edge_id, x.event_type, x.municipality, x.ward_id, x.detail, now()\n    FROM jsonb_to_recordset($1::jsonb) AS x(time timestamptz, edge_id text, event_type text, municipality text, ward_id int, detail jsonb)\n    ON CONFLICT DO NOTHING`\n};\n\nasync function send(rows) {\n  if (simDown()) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  for (const t of ['telemetry', 'alert', 'edge_event', 'fault_label']) {\n    const part = rows.filter(x => x.t === t).map(x => x.r);\n    for (let i = 0; i < part.length; i += BATCH)\n      await pool.query(SQL[t], [JSON.stringify(part.slice(i, i + BATCH))]);\n  }\n}\n\nconst spoolFiles = () => fs.readdirSync(SPOOL);\nconst spoolBytes = () => spoolFiles().reduce((n, f) => n + fs.statSync(path.join(SPOOL, f)).size, 0);\nconst replayFiles = () => spoolFiles().filter(f => f.startsWith('replay-')).sort();\nconst backlog = () => replayFiles().length > 0 || (fs.existsSync(CUR) && fs.statSync(CUR).size > 0);\n\nfunction spool(rows) {\n  if (spoolBytes() > MAX_SPOOL) {          // disk guard: keep alerts and events, drop telemetry\n    const n = rows.length;\n    rows = rows.filter(x => x.t !== 'telemetry');\n    node.warn(LANE + ': spool full (' + Math.round(MAX_SPOOL / 1048576) + ' MB): dropped ' + (n - rows.length) + ' telemetry rows');\n  }\n  if (rows.length) fs.appendFileSync(CUR, rows.map(x => JSON.stringify(x)).join('\\n') + '\\n');\n}\n\nfunction markDown(err) {\n  if (global.get(UP) !== false) {\n    global.set(UP, false);\n    spool([ev('uplink_down', { reason: String((err && err.message) || err).slice(0, 200) })]);\n  }\n}\nfunction markUp() {\n  const was = global.get(UP);\n  global.set(UP, true);\n  if (was === false) { spool([ev('uplink_up')]); return true; }\n  return false;\n}\n\nfunction status() {\n  const kb = Math.round(spoolBytes() / 1024);\n  if (global.get(UP) === false) node.status({ fill: 'red', shape: 'dot', text: LANE + ': uplink DOWN | spooled ' + kb + ' KB' });\n  else if (backlog()) node.status({ fill: 'yellow', shape: 'dot', text: LANE + ': syncing | ' + kb + ' KB queued' });\n  else node.status({ fill: 'green', shape: 'dot', text: LANE + ': uplink OK | queue empty' });\n}\n\nasync function flush() {\n  context.set('timer', 0);\n  const rows = context.get('buf') || [];\n  if (!rows.length) return;\n  context.set('buf', []);\n  if (!context.get('busy') && !backlog() && global.get(UP) !== false) {\n    try { await send(rows); markUp(); status(); return; } catch (e) { markDown(e); }\n  }\n  spool(rows);\n  status();\n}\n\nasync function replay() {\n  if (fs.existsSync(CUR) && fs.statSync(CUR).size > 0)\n    fs.renameSync(CUR, path.join(SPOOL, 'replay-' + Date.now() + '.ndjson'));\n  let total = 0, files = 0, oldest = null, newest = null;\n  const t0 = Date.now();\n  for (const f of replayFiles()) {\n    const full = path.join(SPOOL, f);\n    const rows = [];\n    for (const line of fs.readFileSync(full, 'utf8').split('\\n')) {\n      if (!line.trim()) continue;\n      try { rows.push(JSON.parse(line)); } catch (e) { /* torn last line after a power cut: skip */ }\n    }\n    try { await send(rows); } catch (e) { markDown(e); return false; }\n    fs.unlinkSync(full);\n    files++; total += rows.length;\n    for (const x of rows) if (x.t === 'telemetry' || x.t === 'alert') {\n      const tm = x.r.time;\n      if (!oldest || tm < oldest) oldest = tm;\n      if (!newest || tm > newest) newest = tm;\n    }\n  }\n  if (total > 0) {\n    const e = ev('sync_completed', { rows: total, files, oldest, newest, seconds: Math.round((Date.now() - t0) / 1000) });\n    try { await send([e]); } catch (err) { spool([e]); }\n  }\n  return true;\n}\n\nif (msg.topic === 'data') {\n  const rows = msg.payload;\n  if (!Array.isArray(rows) || !rows.length) return null;\n  const buf = context.get('buf') || [];\n  for (const r of rows) buf.push(r);\n  context.set('buf', buf);\n  if (buf.length >= BATCH) { await flush(); return null; }\n  const t = context.get('timer');\n  if (!t || Date.now() - t > 5000) {                 // collect simultaneous packets into one insert\n    context.set('timer', Date.now());\n    setTimeout(() => flush().catch(e => node.error(LANE + ': ' + e.message)), WINDOW_MS);\n  }\n  return null;\n}\n\nif (msg.topic === 'tick') {\n  await flush();\n  if (context.get('busy')) return null;\n  context.set('busy', true);\n  try {\n    try {\n      if (simDown()) throw new Error('simulated uplink down');\n      if (!pool) throw new Error('no database pool');\n      await pool.query('SELECT 1');\n    } catch (e) { markDown(e); status(); return null; }\n    const restored = markUp();\n    await replay();\n    status();\n    return restored ? [null, { topic: 'refresh', payload: 'uplink restored: ' + LANE }] : null;\n  } finally {\n    context.set('busy', false);\n  }\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "const p = new pg.Pool({ max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\np.on('error', e => node.log('pg pool edge: ' + e.message));   // idle connection dropped; the next query reconnects\nglobal.set('hre_pool:edge', p);",
+    "finalize": "const p = global.get('hre_pool:edge');\nglobal.set('hre_pool:edge', undefined);\nif (p) { p.end().catch(() => {}); }   // On Stop is not async: no await",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 770,
+    "wires": [
+      [],
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_edge"
+  },
+  {
+    "id": "m_in_labels",
+    "type": "mqtt in",
+    "name": "hre/labels/# (fault ground truth)",
+    "topic": "hre/labels/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 860,
+    "wires": [
+      [
+        "f_labels"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_edge"
+  },
+  {
+    "id": "f_labels",
+    "type": "function",
+    "name": "Fault labels -> database",
+    "func": "// =============================================================================\n// FAULT LABELS: ground truth published by the sensor fleet on hre/labels/<municipality>/<sensor_id>.\n// Stored in fault_label so detection delay can be measured: first alert minus fault start.\n// Goes through the edge lane, so it is spooled and synced like everything else.\n// =============================================================================\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return null; } }\nif (!p || !p.sensor_id || !p.fault_start || !['fault_start', 'fault_end'].includes(p.event)) return null;\nconst ref = global.get('reference');\nif (ref && !ref.sensors[p.sensor_id]) return null;                 // unknown sensor: ignore\nnode.status({ fill: 'green', shape: 'dot', text: p.event + ': ' + p.sensor_id + ' ' + (p.kind || '') });\nreturn { topic: 'data', payload: [{ t: 'fault_label', r: { time: p.time || p.fault_start, event: p.event, sensor_id: p.sensor_id, kind: String(p.kind || ''), ramp_s: p.ramp_s ?? null, fault_start: p.fault_start, fault_until: p.fault_until ?? null } }] };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 860,
+    "wires": [
+      [
+        "cl_edge"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_edge"
+  },
+  {
+    "id": "g_edge",
+    "type": "group",
+    "name": "EDGE: province-wide, edge-level events and fault labels",
+    "style": {
+      "label": true,
+      "stroke": "#9467bd",
+      "fill": "#9467bd",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "cl_edge",
+      "f_labels",
+      "f_power",
+      "f_wd",
+      "m_in_labels"
+    ],
+    "x": 1150,
+    "y": 715,
+    "w": 1180,
+    "h": 200,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_in_up",
+    "type": "mqtt in",
+    "name": "hre/sim/uplink/# (test control)",
+    "topic": "hre/sim/uplink/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "b_hre",
+    "nl": false,
+    "rap": false,
+    "rh": 0,
+    "inputs": 0,
+    "x": 1300,
+    "y": 940,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "f_uplink",
+    "type": "function",
+    "name": "Uplink switch (per municipality)",
+    "func": "// =============================================================================\n// UPLINK SWITCH (testing): cut or restore ONE municipality's uplink to the cloud while its\n// sensors keep running. Each lane then spools to its own JSON file and syncs on restore.\n//   payload {\"lane\":\"ruwa\",\"down\":true,\"cause\":\"network\"|\"loadshedding\"}   cause=loadshedding also logs\n//          power_loss / power_restored for that municipality (sensors stay up on battery)\n//   payload {\"lane\":\"harare\",\"flap\":{\"cycles\":3,\"down_s\":20,\"up_s\":10}}     intermittent service\n//   lane = harare | chitungwiza | epworth | ruwa | edge | all\n// Also driven by MQTT: hre/sim/uplink/<lane> (same payload) so test scripts can use it.\n// =============================================================================\nconst EDGE = env.get('EDGE_ID') || 'hre-edge-01';\nconst LANES = ['harare', 'chitungwiza', 'epworth', 'ruwa', 'edge'];\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString('utf8');\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { return null; } }\nif (!p || typeof p !== 'object') return null;\nconst lane = p.lane || (typeof msg.topic === 'string' && msg.topic.startsWith('hre/sim/uplink/') ? msg.topic.split('/')[3] : null);\nif (!lane) return null;\nconst targets = lane === 'all' ? LANES : [lane];\n\nfunction setLane(l, down, cause) {\n  const i = LANES.indexOf(l);\n  if (i < 0) return;\n  const was = global.get('sim_uplink_down:' + l) === true;\n  global.set('sim_uplink_down:' + l, down);\n  const msgs = [];\n  if (was !== down && cause === 'loadshedding' && l !== 'edge')\n    msgs.push({ topic: 'data', payload: [{ t: 'edge_event', r: { time: new Date().toISOString(), edge_id: EDGE, event_type: down ? 'power_loss' : 'power_restored', municipality: l, ward_id: null, detail: { cause: 'loadshedding', effect: 'uplink and gateway without mains power; sensors keep running on battery' } } }] });\n  msgs.push({ topic: 'tick' });                        // make the lane notice right now\n  const out = LANES.map(() => null);\n  out[i] = msgs;\n  node.send(out);\n}\n\nif (p.flap) {\n  const f = Object.assign({ cycles: 3, down_s: 20, up_s: 10 }, p.flap);\n  let n = 0;\n  const step = () => {\n    if (n >= f.cycles * 2) return;\n    const down = n % 2 === 0;\n    targets.forEach(l => setLane(l, down, 'network'));\n    n++;\n    setTimeout(step, (down ? f.down_s : f.up_s) * 1000);\n  };\n  step();\n  node.status({ fill: 'yellow', text: 'flapping ' + targets.join(',') + ': ' + f.cycles + 'x ' + f.down_s + 's down / ' + f.up_s + 's up' });\n  return null;\n}\ntargets.forEach(l => setLane(l, p.down === true, p.cause));\nnode.status({ fill: p.down === true ? 'red' : 'green', text: targets.join(',') + ' uplink ' + (p.down === true ? 'DOWN' : 'UP') + (p.cause ? ' (' + p.cause + ')' : '') });\nreturn null;\n",
+    "outputs": 5,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1560,
+    "y": 940,
+    "wires": [
+      [
+        "cl_harare"
+      ],
+      [
+        "cl_chitungwiza"
+      ],
+      [
+        "cl_epworth"
+      ],
+      [
+        "cl_ruwa"
+      ],
+      [
+        "cl_edge"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "f_ref",
+    "type": "function",
+    "name": "Reference data (sensors + baseline)",
+    "func": "const DIR = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\n// REFERENCE DATA: sensors + baseline from the database, cached to disk so the edge\n// can still validate readings and detect faults while the uplink is down.\nconst FILE = path.join(DIR, 'reference.json');\nfs.mkdirSync(DIR, { recursive: true });\nconst pool = global.get('hre_pool:ref');\nlet ref = null, source = 'database';\ntry {\n  if (global.get('sim_uplink_down:all') === true) throw new Error('simulated uplink down');\n  if (!pool) throw new Error('no database pool');\n  const s = await pool.query('SELECT s.sensor_id, s.sensor_type, s.ward_id, w.ward_number, m.slug AS muni, s.active, s.suppressed FROM sensor s JOIN ward w ON w.ward_id = s.ward_id JOIN municipality m ON m.municipality_id = w.municipality_id');\n  const b = await pool.query('SELECT sensor_type, metric_type::text AS metric_type, unit, normal_min, normal_max, crit_min, crit_max FROM baseline');\n  ref = { loaded: new Date().toISOString(), sensors: {}, baseline: {} };\n  for (const r of s.rows) ref.sensors[r.sensor_id] = { type: r.sensor_type, ward_id: r.ward_id, ward_number: r.ward_number, muni: r.muni, active: r.active !== false, suppressed: r.suppressed === true };\n  for (const r of b.rows) (ref.baseline[r.sensor_type] ??= {})[r.metric_type] = { unit: r.unit, nmin: r.normal_min, nmax: r.normal_max, cmin: r.crit_min, cmax: r.crit_max };\n  fs.writeFileSync(FILE + '.tmp', JSON.stringify(ref));\n  fs.renameSync(FILE + '.tmp', FILE);\n} catch (e) {\n  source = 'cached file';\n  try { ref = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e2) { ref = null; }\n  node.warn('reference data: database unavailable (' + e.message + '), using ' + (ref ? 'cached file' : 'nothing'));\n}\nif (ref) {\n  global.set('reference', ref);\n  node.status({ fill: 'green', shape: 'dot', text: Object.keys(ref.sensors).length + ' sensors | ' + source });\n} else {\n  node.status({ fill: 'red', shape: 'ring', text: 'no reference data' });\n}\nreturn ref ? { topic: 'release' } : null;   // tells VALIDATE to release any packets it was holding\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "// Load the cached reference data synchronously at start, before the broker can deliver the backlog.\nconst DIR = env.get('HRE_DIR') || path.join(os.homedir(), '.node-red', 'hre-edge');\ntry { global.set('reference', JSON.parse(fs.readFileSync(path.join(DIR, 'reference.json'), 'utf8'))); }\ncatch (e) { /* first run: no cache yet */ }\n\nconst rp = new pg.Pool({ max: 2, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, query_timeout: 20000 });\nrp.on('error', e => node.log('pg pool ref: ' + e.message));\nglobal.set('hre_pool:ref', rp);",
+    "finalize": "const p = global.get('hre_pool:ref');\nglobal.set('hre_pool:ref', undefined);\nif (p) { p.end().catch(() => {}); }",
+    "libs": [
+      {
+        "var": "fs",
+        "module": "fs"
+      },
+      {
+        "var": "path",
+        "module": "path"
+      },
+      {
+        "var": "os",
+        "module": "os"
+      },
+      {
+        "var": "pg",
+        "module": "pg"
+      }
+    ],
+    "x": 2120,
+    "y": 940,
+    "wires": [
+      [
+        "v_harare",
+        "v_chitungwiza",
+        "v_epworth",
+        "v_ruwa"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "d_rej",
+    "type": "debug",
+    "name": "rejected packets (also logged)",
+    "active": true,
+    "tosidebar": true,
+    "console": true,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 1560,
+    "y": 1030,
+    "wires": [],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "c_catch",
+    "type": "catch",
+    "name": "errors",
+    "scope": null,
+    "uncaught": false,
+    "x": 1820,
+    "y": 1030,
+    "wires": [
+      [
+        "d_err"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "d_err",
+    "type": "debug",
+    "name": "node errors (also logged)",
+    "active": true,
+    "tosidebar": true,
+    "console": true,
+    "tostatus": false,
+    "complete": "true",
+    "targetType": "full",
+    "x": 2120,
+    "y": 1030,
+    "wires": [],
+    "z": "hre_edge_tab",
+    "g": "g_sys"
+  },
+  {
+    "id": "g_sys",
+    "type": "group",
+    "name": "SUPPORT: uplink switch, reference data, errors",
+    "style": {
+      "label": true,
+      "stroke": "#7f7f7f",
+      "fill": "#7f7f7f",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "c_catch",
+      "d_err",
+      "d_rej",
+      "f_ref",
+      "f_uplink",
+      "m_in_up"
+    ],
+    "x": 1150,
+    "y": 885,
+    "w": 1180,
+    "h": 200,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "c_sys",
+    "type": "comment",
+    "name": "SYSTEM TIMERS",
+    "info": "Do not disable. Tick = health check + replay for every lane (30 s). Watchdog every 60 s. Reference data at start and hourly.",
+    "x": 1300,
+    "y": 1140,
+    "wires": [],
+    "z": "hre_edge_tab",
+    "g": "g_timers"
+  },
+  {
+    "id": "i_tick",
+    "type": "inject",
+    "name": "Tick 30 s: health + replay (all lanes)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "tick",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "tick",
+        "vt": "str"
+      }
+    ],
+    "repeat": "30",
+    "crontab": "",
+    "once": true,
+    "onceDelay": 5,
+    "topic": "tick",
+    "payload": "tick",
+    "payloadType": "str",
+    "d": false,
+    "x": 1300,
+    "y": 1180,
+    "wires": [
+      [
+        "cl_harare",
+        "cl_chitungwiza",
+        "cl_epworth",
+        "cl_ruwa",
+        "cl_edge"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_timers"
+  },
+  {
+    "id": "i_wd",
+    "type": "inject",
+    "name": "Watchdog 60 s",
+    "props": [
+      {
+        "p": "payload",
+        "v": "wd",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "60",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "wd",
+    "payloadType": "str",
+    "d": false,
+    "x": 1300,
+    "y": 1220,
+    "wires": [
+      [
+        "f_wd"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_timers"
+  },
+  {
+    "id": "i_ref0",
+    "type": "inject",
+    "name": "Load reference data (start)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "refresh",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": true,
+    "onceDelay": 2,
+    "topic": "",
+    "payload": "refresh",
+    "payloadType": "str",
+    "d": false,
+    "x": 1300,
+    "y": 1260,
+    "wires": [
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_timers"
+  },
+  {
+    "id": "i_ref1",
+    "type": "inject",
+    "name": "Reference data hourly",
+    "props": [
+      {
+        "p": "payload",
+        "v": "refresh",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "3600",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "refresh",
+    "payloadType": "str",
+    "d": false,
+    "x": 1300,
+    "y": 1300,
+    "wires": [
+      [
+        "f_ref"
+      ]
+    ],
+    "z": "hre_edge_tab",
+    "g": "g_timers"
+  },
+  {
+    "id": "g_timers",
+    "type": "group",
+    "name": "SYSTEM TIMERS",
+    "style": {
+      "label": true,
+      "stroke": "#2ca02c",
+      "fill": "#2ca02c",
+      "fill-opacity": "0.08"
+    },
+    "nodes": [
+      "c_sys",
+      "i_ref0",
+      "i_ref1",
+      "i_tick",
+      "i_wd"
+    ],
+    "x": 1150,
+    "y": 1085,
+    "w": 360,
+    "h": 270,
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "f_sim",
+    "type": "function",
+    "name": "CONTROL PANEL (loadshedding switches)",
+    "func": "// =============================================================================\n// CONTROL PANEL (testing only). Real telemetry now comes from the Python nodes over MQTT.\n//   power         loadshedding: retained hre/sim/power/... switches the Python nodes obey\n//   restore_power delete every switch (same effect as hre_control.py --action power-on)\n//   clear_faults  live (NOT retained) \"clear\" for every node\n//   bad           malformed packets to prove the validator rejects them\n// Node-RED never reads the power topics: it has to DETECT an outage from the silence.\n// =============================================================================\nconst ref = global.get('reference');\nconst p = msg.payload || {};\nconst cmd = p.cmd;\nconst ctl = [];\nconst ctlMsg = (topic, payload, retain) => ctl.push({ topic, payload, qos: 1, retain: !!retain });\nconst out2 = text => { node.status({ text }); return [null, ctl.length ? ctl : null]; };\n\nif (cmd === 'clear_faults') {\n  ctlMsg('hre/sim/fault/all', JSON.stringify({ kind: 'clear' }), false);\n  return out2('clear sent to every node');\n}\nif (cmd === 'power') {\n  const key = p.scope === 'province' ? 'all' : p.scope === 'municipality' ? p.municipality + '/all' : p.municipality + '/' + p.ward;\n  ctlMsg('hre/sim/power/' + key, JSON.stringify({ grid: false }), true);\n  return out2('power OFF: ' + key);\n}\nif (cmd === 'restore_power') {\n  if (!ref) { node.warn('control panel: reference data not loaded yet'); return null; }\n  const keys = new Set(['all']);\n  for (const s of Object.values(ref.sensors)) { keys.add(s.muni + '/all'); keys.add(s.muni + '/' + s.ward_number); }\n  for (const k of keys) ctlMsg('hre/sim/power/' + k, '', true);\n  return out2('power restored everywhere (' + keys.size + ' switches cleared)');\n}\nif (cmd === 'bad') {\n  const now = new Date().toISOString();\n  return [[\n    { payload: 'this is not json' },\n    { payload: { sensor_id: 'nope-water-99', ts: now, readings: { pressure: 3 } } },\n    { payload: { sensor_id: 'harare-water-01', ts: now, readings: { pressure: 'abc' } } },\n    { payload: { sensor_id: 'harare-water-01', ts: new Date(Date.now() + 3600e3).toISOString(), readings: { pressure: 3 } } },\n    { payload: { sensor_id: 'harare-water-01', ts: now, readings: { pressure: 999 } } },\n    { payload: { sensor_id: 'harare-water-01', ts: now, readings: { temperature: 21 } } },\n    { topic: 'hre/telemetry/ruwa/harare-water-01', payload: { sensor_id: 'harare-water-01', ts: now, readings: { pressure: 3 } } }\n  ], null];\n}\nreturn null;\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 940,
+    "y": 330,
+    "wires": [
+      [
+        "v_harare"
+      ],
+      [
+        "m_out"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "m_out",
+    "type": "mqtt out",
+    "name": "to sensors: hre/sim/#",
+    "topic": "",
+    "qos": "1",
+    "retain": "",
+    "respTopic": "",
+    "contentType": "",
+    "userProps": "",
+    "correl": "",
+    "expiry": "",
+    "broker": "b_hre",
+    "x": 1180,
+    "y": 420,
+    "wires": [],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "c_a",
+    "type": "comment",
+    "name": "TEST CONTROLS",
+    "info": "Faults are injected with the per-VLAN fault scripts (hre_fault_water.py / hre_fault_sewer.py). These buttons clear them and test the validator.",
+    "x": 200,
+    "y": 90,
+    "wires": [],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_clear",
+    "type": "inject",
+    "name": "Clear all faults (live message)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"clear_faults\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"clear_faults\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 200,
+    "y": 130,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_restore",
+    "type": "inject",
+    "name": "Restore ALL power (clear every switch)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"restore_power\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"restore_power\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 200,
+    "y": 170,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_bad",
+    "type": "inject",
+    "name": "Send bad packets",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"bad\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"bad\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 200,
+    "y": 210,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_goff",
+    "type": "inject",
+    "name": "Edge VM grid power OFF",
+    "props": [
+      {
+        "p": "payload",
+        "v": "off",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "off",
+    "payloadType": "str",
+    "d": false,
+    "x": 200,
+    "y": 250,
+    "wires": [
+      [
+        "f_power"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_gon",
+    "type": "inject",
+    "name": "Edge VM grid power ON",
+    "props": [
+      {
+        "p": "payload",
+        "v": "on",
+        "vt": "str"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "on",
+    "payloadType": "str",
+    "d": false,
+    "x": 200,
+    "y": 290,
+    "wires": [
+      [
+        "f_power"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "c_b",
+    "type": "comment",
+    "name": "LOADSHEDDING: sensors lose power (silent)",
+    "info": "Retained hre/sim/power/... switches. The Python nodes go quiet; Node-RED must detect it from the silence. Undo with 'Restore ALL power'.",
+    "x": 560,
+    "y": 90,
+    "wires": [],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_w_harare",
+    "type": "inject",
+    "name": "One ward: HARARE ward 1",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"harare\", \"ward\": 1}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"harare\", \"ward\": 1}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 130,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_w_chitungwiza",
+    "type": "inject",
+    "name": "One ward: CHITUNGWIZA ward 1",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"chitungwiza\", \"ward\": 1}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"chitungwiza\", \"ward\": 1}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 166,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_w_epworth",
+    "type": "inject",
+    "name": "One ward: EPWORTH ward 1",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"epworth\", \"ward\": 1}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"epworth\", \"ward\": 1}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 202,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_w_ruwa",
+    "type": "inject",
+    "name": "One ward: RUWA ward 1",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"ruwa\", \"ward\": 1}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"ward\", \"municipality\": \"ruwa\", \"ward\": 1}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 238,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_m_harare",
+    "type": "inject",
+    "name": "Whole municipality: HARARE",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"harare\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"harare\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 282,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_m_chitungwiza",
+    "type": "inject",
+    "name": "Whole municipality: CHITUNGWIZA",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"chitungwiza\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"chitungwiza\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 318,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_m_epworth",
+    "type": "inject",
+    "name": "Whole municipality: EPWORTH",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"epworth\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"epworth\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 354,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_m_ruwa",
+    "type": "inject",
+    "name": "Whole municipality: RUWA",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"ruwa\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"municipality\", \"municipality\": \"ruwa\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 390,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_ls_p",
+    "type": "inject",
+    "name": "ENTIRE province (HRE-METRO)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"cmd\": \"power\", \"scope\": \"province\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"cmd\": \"power\", \"scope\": \"province\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 560,
+    "y": 434,
+    "wires": [
+      [
+        "f_sim"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "c_c",
+    "type": "comment",
+    "name": "UPLINK: per-municipality connectivity to the cloud (sensors keep running)",
+    "info": "Each lane spools to its own JSON file while its uplink is down and syncs when it returns. 'Loadshed' also logs power_loss / power_restored for that municipality.",
+    "x": 940,
+    "y": 560,
+    "wires": [],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_down_harare",
+    "type": "inject",
+    "name": "HARARE: uplink DOWN",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"harare\", \"down\": true, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"harare\", \"down\": true, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 600,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_up_harare",
+    "type": "inject",
+    "name": "HARARE: uplink UP",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"harare\", \"down\": false, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"harare\", \"down\": false, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 634,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_flap_harare",
+    "type": "inject",
+    "name": "HARARE: uplink FLAP (3x 20s down / 10s up)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"harare\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"harare\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 668,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_ls_harare",
+    "type": "inject",
+    "name": "HARARE: LOADSHED uplink cut (sensors on battery)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"harare\", \"down\": true, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"harare\", \"down\": true, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 702,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_lr_harare",
+    "type": "inject",
+    "name": "HARARE: loadshed over, uplink restored",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"harare\", \"down\": false, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"harare\", \"down\": false, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 736,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_down_chitungwiza",
+    "type": "inject",
+    "name": "CHITUNGWIZA: uplink DOWN",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"chitungwiza\", \"down\": true, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"chitungwiza\", \"down\": true, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 780,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_up_chitungwiza",
+    "type": "inject",
+    "name": "CHITUNGWIZA: uplink UP",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"chitungwiza\", \"down\": false, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"chitungwiza\", \"down\": false, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 814,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_flap_chitungwiza",
+    "type": "inject",
+    "name": "CHITUNGWIZA: uplink FLAP (3x 20s down / 10s up)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"chitungwiza\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"chitungwiza\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 848,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_ls_chitungwiza",
+    "type": "inject",
+    "name": "CHITUNGWIZA: LOADSHED uplink cut (sensors on battery)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"chitungwiza\", \"down\": true, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"chitungwiza\", \"down\": true, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 882,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_lr_chitungwiza",
+    "type": "inject",
+    "name": "CHITUNGWIZA: loadshed over, uplink restored",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"chitungwiza\", \"down\": false, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"chitungwiza\", \"down\": false, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 916,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_down_epworth",
+    "type": "inject",
+    "name": "EPWORTH: uplink DOWN",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"epworth\", \"down\": true, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"epworth\", \"down\": true, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 960,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_up_epworth",
+    "type": "inject",
+    "name": "EPWORTH: uplink UP",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"epworth\", \"down\": false, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"epworth\", \"down\": false, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 994,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_flap_epworth",
+    "type": "inject",
+    "name": "EPWORTH: uplink FLAP (3x 20s down / 10s up)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"epworth\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"epworth\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1028,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_ls_epworth",
+    "type": "inject",
+    "name": "EPWORTH: LOADSHED uplink cut (sensors on battery)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"epworth\", \"down\": true, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"epworth\", \"down\": true, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1062,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_lr_epworth",
+    "type": "inject",
+    "name": "EPWORTH: loadshed over, uplink restored",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"epworth\", \"down\": false, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"epworth\", \"down\": false, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1096,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_down_ruwa",
+    "type": "inject",
+    "name": "RUWA: uplink DOWN",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"ruwa\", \"down\": true, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"ruwa\", \"down\": true, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1140,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_up_ruwa",
+    "type": "inject",
+    "name": "RUWA: uplink UP",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"ruwa\", \"down\": false, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"ruwa\", \"down\": false, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1174,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_flap_ruwa",
+    "type": "inject",
+    "name": "RUWA: uplink FLAP (3x 20s down / 10s up)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"ruwa\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"ruwa\", \"flap\": {\"cycles\": 3, \"down_s\": 20, \"up_s\": 10}}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1208,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_ls_ruwa",
+    "type": "inject",
+    "name": "RUWA: LOADSHED uplink cut (sensors on battery)",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"ruwa\", \"down\": true, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"ruwa\", \"down\": true, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1242,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_lr_ruwa",
+    "type": "inject",
+    "name": "RUWA: loadshed over, uplink restored",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"ruwa\", \"down\": false, \"cause\": \"loadshedding\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"ruwa\", \"down\": false, \"cause\": \"loadshedding\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1276,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_all_d",
+    "type": "inject",
+    "name": "ALL municipalities: uplink DOWN",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"all\", \"down\": true, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"all\", \"down\": true, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1320,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "i_up_all_u",
+    "type": "inject",
+    "name": "ALL municipalities: uplink UP",
+    "props": [
+      {
+        "p": "payload",
+        "v": "{\"lane\": \"all\", \"down\": false, \"cause\": \"network\"}",
+        "vt": "json"
+      },
+      {
+        "p": "topic",
+        "v": "",
+        "vt": "str"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{\"lane\": \"all\", \"down\": false, \"cause\": \"network\"}",
+    "payloadType": "json",
+    "d": false,
+    "x": 940,
+    "y": 1354,
+    "wires": [
+      [
+        "f_uplink"
+      ]
+    ],
+    "z": "hre_edge_tab"
+  },
+  {
+    "id": "b_hre",
+    "type": "mqtt-broker",
+    "name": "HRE broker",
+    "broker": "${MQTT_HOST}",
+    "port": "${MQTT_PORT}",
+    "clientid": "${EDGE_ID}",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "30",
+    "cleansession": false,
+    "autoUnsubscribe": false,
+    "birthTopic": "",
+    "birthQos": "0",
+    "birthPayload": "",
+    "birthMsg": {},
+    "closeTopic": "",
+    "closeQos": "0",
+    "closePayload": "",
+    "closeMsg": {},
+    "willTopic": "",
+    "willQos": "0",
+    "willPayload": "",
+    "willMsg": {},
+    "userProps": "",
+    "sessionExpiry": "",
+    "credentials": {
+      "user": "${MQTT_USER}",
+      "password": "${MQTT_PASSWORD}"
+    }
+  },
+  {
+    "id": "hre_edge_tab",
+    "type": "tab",
+    "label": "HRE Edge",
+    "disabled": false,
+    "info": "Edge gateway: one lane per municipality, each with its own uplink and spool.",
+    "z": "hre_edge_tab"
+  }
+]
