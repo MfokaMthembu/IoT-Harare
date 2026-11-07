@@ -2,8 +2,6 @@
 
 **An IoT-based monitoring network for real-time detection of water distribution and sewage system faults in Harare.**
 
-BSc (Honours) Computing dissertation artefact by Edwell Dube (2230237), Botho University.
-
 The artefact is a simulated, city-scale monitoring network for Harare, Chitungwiza, Epworth and Ruwa. There are 190 simulated sensors, one water sensor and one sewer sensor in each of 95 wards. Readings travel through this pipeline:
 
 ```
