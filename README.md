@@ -248,7 +248,7 @@ From the **Menu → Manage palette → Install** tab, install the PostgreSQL nod
 
 ### 5.4 Import the flows
 
-1. Go to **Menu → Import** and select `<flows.json>` from this repository.
+1. Go to **Menu → Import** and select `hre-edge-workflow` from this repository in the folder node-red-workflows.
 2. Credentials are not exported with flows, so re-enter them:
    - **MQTT broker node:** server `127.0.0.1`, port `1883`, username `nodered` and its password.
    - **PostgreSQL node:** the connection details from Section 6.
@@ -273,7 +273,7 @@ The database (PostgreSQL with TimescaleDB) is hosted on Railway. **You do not ne
 ```bash
 sudo apt install -y postgresql-client
 
-psql "postgresql://postgres:ea1234@maglev.proxy.rlwy.net:16330/railway"
+psql "postgresql://postgres:ea1234@maglev.proxy.rlwy.net:16330/railway"                ### existing db instance already hosted 
 ```
 
 ### 6.2 Connect from Node-RED or Grafana
