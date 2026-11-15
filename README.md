@@ -273,7 +273,7 @@ The database (PostgreSQL with TimescaleDB) is hosted on Railway. **You do not ne
 ```bash
 sudo apt install -y postgresql-client
 
-psql "postgresql://postgres:ea1234@maglev.proxy.rlwy.net:16330/railway"                ### existing db instance already hosted 
+psql "postgresql://"                ### existing db instance already hosted, available upon request
 ```
 
 ### 6.2 Connect from Node-RED or Grafana
